@@ -1,0 +1,14 @@
+services:
+  vibe:
+    build: .
+    container_name: vibe
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./app:/app/app
+      - ./downloads:/app/downloads
+      - ./archives:/app/archives
+    environment:
+      PORT: 8080
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped

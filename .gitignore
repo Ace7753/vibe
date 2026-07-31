@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+server.log
+server_out.log
+server_error.log
+
+# Android
+.gradle/
+android/.gradle/
+android/app/build/
+android/local.properties
+android/*.png
+
+# App Data
+downloads/
+archives/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# App Assets
+*.apk
+vibe.apk
+
+# Gemini Artifacts
+.artifacts/
+implementation_plan.artifact.md
+task.artifact.md
+walkthrough.artifact.md
