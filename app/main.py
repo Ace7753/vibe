@@ -32,10 +32,23 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
+    config = DEFAULT_CONFIG.copy()
     if CONFIG_FILE.exists():
-        try: return {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text())}
+        try: config.update(json.loads(CONFIG_FILE.read_text()))
         except: pass
-    return DEFAULT_CONFIG.copy()
+
+    # Environment Variable Overrides (Cloud-Friendly)
+    env_map = {
+        "VIBE_TITLE": "title",
+        "VIBE_TAGLINE": "tagline",
+        "VIBE_ACCENT": "accent",
+        "VIBE_BG": "bg"
+    }
+    for env_key, config_key in env_map.items():
+        val = os.getenv(env_key)
+        if val: config[config_key] = val
+
+    return config
 
 SITE_CONFIG = load_config()
 JOBS: Dict[str, dict] = {}
