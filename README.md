@@ -1,164 +1,51 @@
-# 🎵 Vibe - Spotify Downloader
+# 🎵 Vibe (Cloud Edition)
 
-**Ultimate Spotify Downloader with Web UI & Android App**
+[![Status](https://img.shields.io/badge/Status-Cloud_Active-success?style=for-the-badge&logo=render)](https://github.com/Ace7753/vibeandroid)
+[![Platform](https://img.shields.io/badge/Platform-Android-blue?style=for-the-badge&logo=android)](https://github.com/Ace7753/vibeandroid)
 
-Everything merged and unified into one production-ready project.
-
----
-
-## ✨ Status
-
-✅ **Server Running** → http://localhost:8081
-✅ **Configuration** → vibe-config.json
-✅ **Deno Enabled** → YouTube downloads supported
-✅ **Downloads** → vibe/downloads/
-✅ **Android App** → Ready to build
+**The powerful music downloader for Android, connected to the cloud.**
+This is the primary branch (`main`) which contains the Android app configured for **Cloud Mode**. It connects to your remote Vibe engine, allowing you to download music anywhere without needing your PC to be on.
 
 ---
 
-## 🚀 Features
+## 🚀 Quick Start
 
-- ✓ Download Spotify tracks (MP3/M4A/FLAC/Opus)
-- ✓ Download YouTube videos (Deno enabled)
-- ✓ Real-time download logs
-- ✓ Web interface on port 8081
-- ✓ Android app (WebView wrapper)
-- ✓ File browser & ZIP packs
-- ✓ Customizable admin panel
-- ✓ Docker containerized
-- ✓ Batch downloads support
+### 1️⃣ Install the Vibe App
+Install the [**vibe.apk**](vibe.apk) found in the root of this project onto your phone.
 
----
-
-## 🎯 Quick Start
-
-### Web Interface
-```
-http://localhost:8081
-```
-
-### Download a Track
-1. Paste Spotify link or YouTube URL
-2. Choose format (MP3/M4A/FLAC/Opus)
-3. Click Download
-4. Watch real-time log
-
-### Mobile Access (Same WiFi)
-```
-http://YOUR_PC_IP:8081
-```
+### 2️⃣ Configure your Server
+1. Open the Vibe app on your device.
+2. If it's your first time opening, or if you need to change your server:
+   - **Long-press** anywhere on the screen.
+   - A dialog will appear asking for your **Server URL**.
+   - Enter your secure cloud address (e.g., your Render URL) and tap **Connect**.
 
 ---
 
-## 🔧 Configuration
+## ⚡ Features
 
-**Active Config:** `vibe-config.json`
-
-```json
-{
-    "title": "Vibe",
-    "tagline": "Spotify Downloader",
-    "accent": "#ff2e88",
-    "bg": "#050505",
-    "port": 8081,
-    "deno_enabled": true,
-    "features": {
-        "spotify_downloads": true,
-        "youtube_downloads": true,
-        "deno_support": true,
-        "batch_downloads": true
-    }
-}
-```
-
-**Edit & Restart:**
-```bash
-nano vibe-config.json
-docker compose restart
-```
+- ✅ **Cloud-Powered**: Downloads are processed by your remote server, saving your phone's battery.
+- ✅ **Metadata & Lyrics**: Automatically fetches high-quality art and synced lyrics.
+- ✅ **Remote Access**: Works from anywhere with an internet connection. No PC required.
+- ✅ **Secure Switcher**: Long-press gesture to swap between different cloud servers or local engines.
 
 ---
 
-## 📱 Android App
+## 📂 Project Structure
 
-Build APK:
-1. Open Android Studio
-2. File → Open → `vibe/android`
-3. Build → Build APK(s)
-4. APK: `android/build/outputs/apk/debug/app-debug.apk`
-
----
-
-## 🐳 Docker Commands
-
-```bash
-# Start
-docker compose up -d
-
-# Stop
-docker compose down
-
-# Logs
-docker logs vibe
-
-# Restart
-docker compose restart
-```
-
----
-
-## 📍 File Structure
-
-```
+```text
 vibe/
-├── app/                    ← Backend (FastAPI)
-├── android/                ← Android app
-├── downloads/              ← Downloaded music
-├── vibe-config.json        ← Configuration ✓
-├── docker-compose.yml
-├── Dockerfile
-└── README.md
+├── android/        # Android Studio project (The Client)
+├── app/            # Vibe Engine (Cloud/Server source)
+├── vibe.apk        # The installable app
+└── README.md       # You are here!
 ```
 
 ---
 
-## 🎵 Download Formats
+## 📱 Other Versions
 
-- MP3 (most compatible)
-- M4A (iTunes quality)
-- FLAC (lossless)
-- Opus (modern compression)
+Looking for the **100% Standalone (Offline)** version?  
+Switch to the [**`option-2`**](https://github.com/Ace7753/vibeandroid/tree/option-2) branch to see instructions for running the engine directly on your phone via Termux.
 
----
-
-## ✅ What's Enabled
-
-- ✓ Spotify downloads
-- ✓ YouTube downloads (with Deno)
-- ✓ Batch processing
-- ✓ Real-time logs
-- ✓ Admin customization
-- ✓ File management
-
----
-
-## 🆘 Troubleshooting
-
-**Can't connect?**
-- Check: `docker ps | findstr vibe`
-- Logs: `docker logs vibe`
-- Port: Should be 8081
-
-**Download failed?**
-- Check internet
-- Verify link is valid
-- See logs for details
-
-**YouTube not working?**
-- Deno is enabled ✓
-- Try different video
-- Check privacy settings
-
----
-
-**One folder. Everything included. Ready to use.** 🚀🎵
+**Stay connected. Stay Vibe-ing.** 🎵☁️✨
