@@ -47,6 +47,7 @@ MASTER_TOKEN = "MASTER_ADMIN_UNLOCKED"
 app = FastAPI(title="Vibe")
 app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="downloads")
 app.mount("/archives", StaticFiles(directory=str(ARCHIVE_DIR)), name="archives")
+app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
 # --- ENGINE ---
 async def get_metadata(query: str):
@@ -234,9 +235,12 @@ async def index():
     </nav>
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6 pb-32">
         <header class="mb-12 flex justify-between items-start">
-            <div>
-                <h1 id="vibe-logo" class="text-3xl font-black tracking-tighter">{c['title']}</h1>
-                <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
+            <div class="flex items-center gap-4">
+                <img src="/assets/vibe_icon_original.png" class="w-16 h-16 rounded-2xl shadow-2xl" alt="Logo">
+                <div>
+                    <h1 id="vibe-logo" class="text-3xl font-black tracking-tighter">{c['title']}</h1>
+                    <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
+                </div>
             </div>
             <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Clear All</button>
         </header>
