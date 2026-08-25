@@ -5,6 +5,7 @@ import sys
 import uuid
 import zipfile
 import socket
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Set
@@ -19,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads"))).resolve()
 ARCHIVE_DIR = Path(os.getenv("ARCHIVE_DIR", str(BASE_DIR / "archives"))).resolve()
 CONFIG_FILE = BASE_DIR / "vibe-config.json"
+COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 for d in [DOWNLOAD_DIR, ARCHIVE_DIR]: d.mkdir(exist_ok=True)
 
@@ -36,18 +38,6 @@ def load_config():
     if CONFIG_FILE.exists():
         try: config.update(json.loads(CONFIG_FILE.read_text()))
         except: pass
-
-    # Environment Variable Overrides (Cloud-Friendly)
-    env_map = {
-        "VIBE_TITLE": "title",
-        "VIBE_TAGLINE": "tagline",
-        "VIBE_ACCENT": "accent",
-        "VIBE_BG": "bg"
-    }
-    for env_key, config_key in env_map.items():
-        val = os.getenv(env_key)
-        if val: config[config_key] = val
-
     return config
 
 SITE_CONFIG = load_config()
@@ -59,23 +49,55 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="download
 app.mount("/archives", StaticFiles(directory=str(ARCHIVE_DIR)), name="archives")
 
 # --- ENGINE ---
+async def get_metadata(query: str):
+    """Fetch metadata for ZIP naming"""
+    temp_meta = BASE_DIR / f"meta_{uuid.uuid4().hex}.spotdl"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "spotdl", "save", query,
+            "--save-file", str(temp_meta),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.wait()
+        if temp_meta.exists():
+            data = json.loads(temp_meta.read_text())
+            if isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                artist = first.get("artist", "Unknown")
+                album = first.get("album_name", "Unknown")
+                name = first.get("name", "Unknown")
+
+                if "/playlist/" in query:
+                    # spotDL doesn't easily give playlist name in .spotdl file
+                    return "Playlist"
+                if len(data) > 1: # Album or multiple tracks
+                    return f"{artist} - {album}"
+                return f"{artist} - {name}"
+    except: pass
+    finally:
+        if temp_meta.exists(): temp_meta.unlink()
+    return "Vibe_Pack"
+
 async def run_spotdl(job_id: str, query: str, base_url: str):
     job = JOBS[job_id]
     job["status"] = "running"
-    before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
-    # --- THE HEAVYWEIGHT CONFIG FOR AWS (2026) ---
-    cookie_file = BASE_DIR / "cookies.txt"
+    # Pre-fetch metadata for ZIP naming
+    job["log"].append("🔍 Fetching metadata for package naming...")
+    zip_base_name = await get_metadata(query)
+    job["log"].append(f"📦 Package will be named: {zip_base_name}")
+
+    before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
     # Dynamic Numbering: Only use {list-position} for Playlists
     is_playlist = "/playlist/" in query
     output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
 
-    # Use native m4a format and geo-bypass to maximize block resistance
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
-        "--format", "m4a", # Native format bypasses conversion blocks
+        "--format", "m4a",
         "--bitrate", "disable",
         "--threads", "1",
         "--log-level", "DEBUG",
@@ -88,16 +110,12 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
         cmd.append("--playlist-numbering")
         job["log"].append("🔢 Playlist detected: Adding numbering")
 
-    # Verbose Debugging for Cookies
-    job["log"].append(f"🔍 Checking for cookies at: {cookie_file}")
-    if cookie_file.exists():
-        size = cookie_file.stat().st_size
-        cmd.extend(["--cookie-file", str(cookie_file)])
-        job["log"].append(f"🎫 Cookie file found ({size} bytes). Applying to engine.")
+    if COOKIE_FILE.exists():
+        cmd.extend(["--cookie-file", str(COOKIE_FILE)])
+        job["log"].append(f"🎫 Cookies applied ({COOKIE_FILE.stat().st_size} bytes)")
     else:
-        job["log"].append("⚠️ No cookies.txt found! AWS may be blocked by YouTube.")
+        job["log"].append("⚠️ No cookies.txt found! Downloads might fail.")
 
-    # Set environment for Deno and Cache
     env = os.environ.copy()
     env["SPOTDL_CACHE_DIR"] = str(BASE_DIR)
 
@@ -116,25 +134,27 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
             if msg: job["log"].append(msg); job["log"] = job["log"][-100:]
         rc = await proc.wait()
         job["status"] = "complete" if rc == 0 else "failed"
+
         if rc == 0:
             after = {f.name for f in DOWNLOAD_DIR.glob("*")}
             new_files = list(after - before)
             if new_files:
-                zip_name = f"Vibe_{job_id[:8]}.zip"
+                # Clean filename for ZIP
+                safe_name = "".join([c for c in zip_base_name if c.isalnum() or c in (' ', '-', '_')]).strip()
+                zip_name = f"{safe_name}_{job_id[:4]}.zip"
                 with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
                     for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
                 job["zip_url"] = f"{base_url}/archives/{zip_name}"
+                job["log"].append(f"✅ Created ZIP: {zip_name}")
     except Exception as e:
         job["status"] = "failed"; job["log"].append(f"Error: {str(e)}")
 
 # --- API ---
 @app.get("/api/health")
-async def health():
-    return {"status": "ok"}
+async def health(): return {"status": "ok"}
 
 @app.get("/api/config_data")
-async def get_cfg():
-    return SITE_CONFIG
+async def get_cfg(): return SITE_CONFIG
 
 @app.post("/api/download")
 async def start_dl(request: Request, query: str = Form(...)):
@@ -145,8 +165,7 @@ async def start_dl(request: Request, query: str = Form(...)):
     return {"job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    return JOBS.get(job_id, {"status": "not_found", "log": []})
+async def get_job(job_id: str): return JOBS.get(job_id, {"status": "not_found", "log": []})
 
 @app.get("/api/files")
 async def list_files(request: Request):
@@ -158,6 +177,20 @@ async def list_files(request: Request):
         if p.is_file() and not p.name.startswith('.'):
             files.append({"name": p.name, "url": f"{base_url}/downloads/{p.name}", "type": "mp3", "size": p.stat().st_size})
     return {"files": files[:150]}
+
+@app.post("/api/clear")
+async def clear_downloads():
+    """Wipe downloads and archives"""
+    try:
+        count = 0
+        for folder in [DOWNLOAD_DIR, ARCHIVE_DIR]:
+            for item in folder.glob("*"):
+                if item.is_file():
+                    item.unlink()
+                    count += 1
+        return {"status": "ok", "cleared": count}
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
 
 @app.post("/api/config")
 async def update_config(token: str = Form(...), title: str = Form(...), tagline: str = Form(...), accent: str = Form(...), bg: str = Form(...)):
@@ -200,9 +233,12 @@ async def index():
         </button>
     </nav>
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6 pb-32">
-        <header class="mb-12">
-            <h1 id="vibe-logo" class="text-3xl font-black tracking-tighter">{c['title']}</h1>
-            <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
+        <header class="mb-12 flex justify-between items-start">
+            <div>
+                <h1 id="vibe-logo" class="text-3xl font-black tracking-tighter">{c['title']}</h1>
+                <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
+            </div>
+            <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Clear All</button>
         </header>
         <section id="page-download" class="tab-transition space-y-8">
             <h2 class="text-5xl font-black">Download <span style="color:{c['accent']}">Spotify</span></h2>
@@ -213,7 +249,6 @@ async def index():
             <div id="status-card" class="glass rounded-2xl p-8">
                 <div class="flex justify-between mb-4"><span class="text-xs opacity-40 uppercase tracking-widest font-bold">Progress</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
 
-                <!-- NEW CLEAN PROGRESS UI -->
                 <div class="space-y-4">
                     <p id="activity-text" class="text-sm font-bold opacity-80 truncate">Waiting for input...</p>
                     <div class="w-full bg-white/5 rounded-full h-2 overflow-hidden">
@@ -240,6 +275,8 @@ async def index():
         function showPage(p) {{ ['download','files'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
         async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '5%'; document.getElementById('activity-text').innerText = 'Initializing...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
 
+        async function clearAll() {{ if(!confirm('Clear all downloads and archives?')) return; await fetch('/api/clear', {{method:'POST'}}); refreshFiles(); alert('Cleared!'); }}
+
         async function pollEngine() {{
             if(!currentJob) return;
             const res = await fetch('/api/jobs/'+currentJob);
@@ -249,17 +286,13 @@ async def index():
             logElement.innerText = job.log.join('\\n');
             logElement.scrollTop = logElement.scrollHeight;
 
-            // --- PARSE LOGS FOR PROGRESS ---
             const lastLines = job.log.slice(-10);
             let progress = 0;
             let activity = "Processing...";
 
             for (const line of lastLines) {{
-                // Find percentage (e.g. 45.2%)
                 const pctMatch = line.match(/(\\d+(\\.\\d+)?%)/);
                 if (pctMatch) progress = parseFloat(pctMatch[1]);
-
-                // Find active song
                 if (line.includes('Downloading')) {{
                     const songMatch = line.match(/Downloading\\s+(.*)/);
                     if (songMatch) activity = songMatch[1];
@@ -279,7 +312,7 @@ async def index():
                 refreshFiles();
             }}
         }}
-        async function refreshFiles() {{ const res = await fetch('/api/files'); const data = await res.json(); document.getElementById('file-list').innerHTML = data.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p><p class="text-xs opacity-50">${{(f.size/1024/1024).toFixed(1)}}MB</p></div></a>`).join(''); }}
+        async function refreshFiles() {{ const res = await fetch('/api/files'); const data = await res.json(); document.getElementById('file-list').innerHTML = data.files.length ? data.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p><p class="text-xs opacity-50">${{(f.size/1024/1024).toFixed(1)}}MB</p></div></a>`).join('') : '<p class="text-center py-12 opacity-20 font-bold">No files yet</p>'; }}
         showPage('download');
     </script>
 </body>
@@ -304,7 +337,7 @@ def is_port_busy(port: int) -> bool:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", SITE_CONFIG.get("port", 8080)))
     while is_port_busy(port):
-        if os.getenv("PORT"): break # Don't loop in cloud environments
+        if os.getenv("PORT"): break
         port += 1
 
     local_ip = get_local_ip()
