@@ -309,9 +309,9 @@ if __name__ == "__main__":
 
     local_ip = get_local_ip()
     print("\n" + "="*40)
-    print(f"🎵 VIBE ENGINE STARTING")
-    print(f"🔗 Localhost: http://localhost:{port}")
-    print(f"📱 Mobile:    http://{local_ip}:{port}")
+    print("VIBE ENGINE STARTING")
+    print(f"Localhost: http://localhost:{port}")
+    print(f"Mobile:    http://{local_ip}:{port}")
     print("="*40 + "\n")
 
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

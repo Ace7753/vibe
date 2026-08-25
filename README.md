@@ -1,10 +1,10 @@
-# 🎵 Vibe (Cloud Edition)
+# 🎵 Vibe (Local & Cloud)
 
-[![Status](https://img.shields.io/badge/Status-Cloud_Active-success?style=for-the-badge&logo=amazon-aws)](http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/)
+[![Status](https://img.shields.io/badge/Status-Local_Active-success?style=for-the-badge&logo=android)](http://127.0.0.1:8080/)
 [![Platform](https://img.shields.io/badge/Platform-Android-blue?style=for-the-badge&logo=android)](https://github.com/Ace7753/vibeandroid)
 
-**The powerful music downloader for Android, connected to the cloud.**
-This is the primary branch (`main`) which contains the Android app configured for **Cloud Mode**. It connects to your remote Vibe engine, allowing you to download music anywhere without needing your PC to be on.
+**The powerful music downloader for Android, optimized for local Termux & AWS Cloud.**
+This branch contains the Android app configured for **Local Mode** by default. It connects to your local Vibe engine (Termux or PC) at `http://127.0.0.1:8080/`.
 
 ---
 
@@ -13,12 +13,15 @@ This is the primary branch (`main`) which contains the Android app configured fo
 ### 1️⃣ Install the Vibe App
 Install the [**vibe.apk**](vibe.apk) found in the root of this project onto your phone.
 
-### 2️⃣ Configure your Server
-1. Open the Vibe app on your device.
-2. If it's your first time opening, or if you need to change your server:
-   - **Long-press** anywhere on the screen.
-   - A dialog will appear asking for your **Server URL**.
-   - Enter your secure cloud address (e.g., your Vibe AWS URL) and tap **Connect**.
+### 2️⃣ Start your Server
+- **Termux:** Run `python app/main.py`
+- **PC:** Run `run_server.bat`
+- The app will connect to `http://127.0.0.1:8080/` automatically.
+
+### 3️⃣ Switch to Cloud (Optional)
+1. **Long-press** anywhere on the screen.
+2. Enter the AWS URL: `http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/`
+3. Tap **Connect**.
 
 ---
 

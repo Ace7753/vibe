@@ -4,7 +4,7 @@
 
 ```
 🌐 Server:        RUNNING ✓
-📍 URL:           http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/
+📍 URL:           http://127.0.0.1:8080/ (Local Default)
 🐳 Container:     vibe
 ⚙️ Port:          8080
 🔧 Configuration: ACTIVE ✓
