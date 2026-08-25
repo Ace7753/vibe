@@ -63,9 +63,51 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
     job = JOBS[job_id]
     job["status"] = "running"
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
-    cmd = [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR / "{artist} - {title}.{output-ext}")]
+
+    # --- THE HEAVYWEIGHT CONFIG FOR AWS (2026) ---
+    cookie_file = BASE_DIR / "cookies.txt"
+
+    # Dynamic Numbering: Only use {list-position} for Playlists
+    is_playlist = "/playlist/" in query
+    output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
+
+    # Use native m4a format and geo-bypass to maximize block resistance
+    cmd = [
+        sys.executable, "-m", "spotdl", "download", query,
+        "--output", str(DOWNLOAD_DIR / output_template),
+        "--format", "m4a", # Native format bypasses conversion blocks
+        "--bitrate", "disable",
+        "--threads", "1",
+        "--log-level", "DEBUG",
+        "--search-query", "{artist} - {title}",
+        "--yt-dlp-args", "--impersonate chrome --rm-cache-dir --geo-bypass",
+        "--audio", "youtube", "piped", "soundcloud", "youtube-music"
+    ]
+
+    if is_playlist:
+        cmd.append("--playlist-numbering")
+        job["log"].append("🔢 Playlist detected: Adding numbering")
+
+    # Verbose Debugging for Cookies
+    job["log"].append(f"🔍 Checking for cookies at: {cookie_file}")
+    if cookie_file.exists():
+        size = cookie_file.stat().st_size
+        cmd.extend(["--cookie-file", str(cookie_file)])
+        job["log"].append(f"🎫 Cookie file found ({size} bytes). Applying to engine.")
+    else:
+        job["log"].append("⚠️ No cookies.txt found! AWS may be blocked by YouTube.")
+
+    # Set environment for Deno and Cache
+    env = os.environ.copy()
+    env["SPOTDL_CACHE_DIR"] = str(BASE_DIR)
+
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env
+        )
         assert proc.stdout
         while True:
             line = await proc.stdout.readline()
@@ -169,9 +211,22 @@ async def index():
                 <button onclick="startDownload()" class="w-14 h-14 rounded-2xl flex items-center justify-center text-black shadow-xl" style="background:{c['accent']};"><svg class="w-6 h-6 fill-none stroke-current stroke-3" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
             </div>
             <div id="status-card" class="glass rounded-2xl p-8">
-                <div class="flex justify-between mb-4"><span class="text-xs opacity-40">Engine</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400">READY</span></div>
-                <div id="engine-log" class="text-xs font-mono text-emerald-500/80 h-32 overflow-y-auto leading-relaxed p-1">> Ready</div>
-                <a id="insta-zip" href="#" class="hidden mt-4 w-full block bg-cyan-500/10 text-center py-3 rounded-xl font-bold text-cyan-400 border border-cyan-500/20">📦 Download Pack</a>
+                <div class="flex justify-between mb-4"><span class="text-xs opacity-40 uppercase tracking-widest font-bold">Progress</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
+
+                <!-- NEW CLEAN PROGRESS UI -->
+                <div class="space-y-4">
+                    <p id="activity-text" class="text-sm font-bold opacity-80 truncate">Waiting for input...</p>
+                    <div class="w-full bg-white/5 rounded-full h-2 overflow-hidden">
+                        <div id="progress-bar" class="h-full transition-all duration-500 rounded-full" style="width: 0%; background: {c['accent']}"></div>
+                    </div>
+                </div>
+
+                <button onclick="toggleLogs()" class="mt-6 text-[10px] opacity-30 hover:opacity-100 uppercase font-black tracking-tighter transition-all">View Technical Details</button>
+                <div id="engine-log-container" class="hidden mt-4">
+                    <div id="engine-log" class="text-[10px] font-mono text-emerald-500/60 h-32 overflow-y-auto leading-tight p-2 bg-black/20 rounded-lg">Ready</div>
+                </div>
+
+                <a id="insta-zip" href="#" class="hidden mt-4 w-full block bg-cyan-500/10 text-center py-3 rounded-xl font-bold text-cyan-400 border border-cyan-500/20">📦 Download Pack Your Files</a>
             </div>
         </section>
         <section id="page-files" class="hidden tab-transition space-y-6">
@@ -181,9 +236,49 @@ async def index():
     </main>
     <script>
         let currentJob = null;
+        function toggleLogs() {{ const log = document.getElementById('engine-log-container'); log.classList.toggle('hidden'); }}
         function showPage(p) {{ ['download','files'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
-        async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
-        async function pollEngine() {{ if(!currentJob) return; const res = await fetch('/api/jobs/'+currentJob); const job = await res.json(); document.getElementById('engine-status').innerText = job.status; document.getElementById('engine-log').innerText = job.log.join('\\n'); const log = document.getElementById('engine-log'); log.scrollTop = log.scrollHeight; if(job.status==='running'||job.status==='queued') {{setTimeout(pollEngine, 1000);}} else {{ if(job.zip_url) {{const z=document.getElementById('insta-zip'); z.href=job.zip_url; z.classList.remove('hidden');}} refreshFiles(); }} }}
+        async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '5%'; document.getElementById('activity-text').innerText = 'Initializing...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
+
+        async function pollEngine() {{
+            if(!currentJob) return;
+            const res = await fetch('/api/jobs/'+currentJob);
+            const job = await res.json();
+            document.getElementById('engine-status').innerText = job.status;
+            const logElement = document.getElementById('engine-log');
+            logElement.innerText = job.log.join('\\n');
+            logElement.scrollTop = logElement.scrollHeight;
+
+            // --- PARSE LOGS FOR PROGRESS ---
+            const lastLines = job.log.slice(-10);
+            let progress = 0;
+            let activity = "Processing...";
+
+            for (const line of lastLines) {{
+                // Find percentage (e.g. 45.2%)
+                const pctMatch = line.match(/(\\d+(\\.\\d+)?%)/);
+                if (pctMatch) progress = parseFloat(pctMatch[1]);
+
+                // Find active song
+                if (line.includes('Downloading')) {{
+                    const songMatch = line.match(/Downloading\\s+(.*)/);
+                    if (songMatch) activity = songMatch[1];
+                }}
+                if (line.includes('Searching')) activity = 'Searching for best match...';
+                if (line.includes('Converting')) activity = 'Optimizing audio...';
+            }}
+
+            if (progress > 0) document.getElementById('progress-bar').style.width = progress + '%';
+            document.getElementById('activity-text').innerText = activity;
+
+            if(job.status==='running'||job.status==='queued') {{
+                setTimeout(pollEngine, 1000);
+            }} else {{
+                if (job.status === 'complete') document.getElementById('progress-bar').style.width = '100%';
+                if(job.zip_url) {{const z=document.getElementById('insta-zip'); z.href=job.zip_url; z.classList.remove('hidden');}}
+                refreshFiles();
+            }}
+        }}
         async function refreshFiles() {{ const res = await fetch('/api/files'); const data = await res.json(); document.getElementById('file-list').innerHTML = data.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p><p class="text-xs opacity-50">${{(f.size/1024/1024).toFixed(1)}}MB</p></div></a>`).join(''); }}
         showPage('download');
     </script>
@@ -192,6 +287,16 @@ async def index():
     """
 
 # --- UTILS ---
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
 def is_port_busy(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         return sock.connect_ex(("127.0.0.1", port)) == 0
@@ -201,5 +306,12 @@ if __name__ == "__main__":
     while is_port_busy(port):
         if os.getenv("PORT"): break # Don't loop in cloud environments
         port += 1
-    print(f"Vibe running on http://localhost:{port}")
+
+    local_ip = get_local_ip()
+    print("\n" + "="*40)
+    print(f"🎵 VIBE ENGINE STARTING")
+    print(f"🔗 Localhost: http://localhost:{port}")
+    print(f"📱 Mobile:    http://{local_ip}:{port}")
+    print("="*40 + "\n")
+
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

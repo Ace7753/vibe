@@ -26,14 +26,14 @@ Deno has been successfully installed and configured for spotDL.
 
 ### Download YouTube Video
 
-1. Go to: http://localhost:8081
+1. Go to: http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/
 2. Paste YouTube URL: `https://www.youtube.com/watch?v=...`
 3. Choose format
 4. Click Download
 
 ### Download Spotify
 
-1. Go to: http://localhost:8081
+1. Go to: http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/
 2. Paste Spotify URL: `https://open.spotify.com/track/...`
 3. Choose format
 4. Click Download

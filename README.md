@@ -1,6 +1,6 @@
 # 🎵 Vibe (Cloud Edition)
 
-[![Status](https://img.shields.io/badge/Status-Cloud_Active-success?style=for-the-badge&logo=render)](https://github.com/Ace7753/vibeandroid)
+[![Status](https://img.shields.io/badge/Status-Cloud_Active-success?style=for-the-badge&logo=amazon-aws)](http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/)
 [![Platform](https://img.shields.io/badge/Platform-Android-blue?style=for-the-badge&logo=android)](https://github.com/Ace7753/vibeandroid)
 
 **The powerful music downloader for Android, connected to the cloud.**
@@ -18,7 +18,7 @@ Install the [**vibe.apk**](vibe.apk) found in the root of this project onto your
 2. If it's your first time opening, or if you need to change your server:
    - **Long-press** anywhere on the screen.
    - A dialog will appear asking for your **Server URL**.
-   - Enter your secure cloud address (e.g., your Render URL) and tap **Connect**.
+   - Enter your secure cloud address (e.g., your Vibe AWS URL) and tap **Connect**.
 
 ---
 

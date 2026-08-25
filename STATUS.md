@@ -4,9 +4,9 @@
 
 ```
 🌐 Server:        RUNNING ✓
-📍 URL:           http://localhost:8081
+📍 URL:           http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/
 🐳 Container:     vibe
-⚙️ Port:          8081
+⚙️ Port:          8080
 🔧 Configuration: ACTIVE ✓
 🎵 Deno:          ENABLED ✓
 ```
@@ -63,8 +63,8 @@ vibe/
 
 | Item | Link/Command |
 |------|-------------|
-| **Web UI** | http://localhost:8081 |
-| **API Health** | `curl http://localhost:8081/api/health` |
+| **Web UI** | http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/ |
+| **API Health** | `curl http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/api/health` |
 | **Config** | `vibe-config.json` |
 | **Logs** | `docker logs vibe` |
 | **Downloads** | `vibe/downloads/` |
@@ -80,7 +80,8 @@ vibe/
    - Paste link → Select format → Download (Deno enabled)
 
 3. ✅ **Mobile Access**
-   - Same WiFi → http://YOUR_PC_IP:8081
+   - Same WiFi → http://DEVICE_IP:8080
+   - Termux → http://127.0.0.1:8080
 
 4. ✅ **Build Android App**
    - Android Studio → Open vibe/android → Build APK
@@ -111,7 +112,7 @@ docker exec vibe ls /root/.config/spotdl/deno
 ## 📈 NEXT STEPS
 
 1. **Test Download**
-   - Visit: http://localhost:8081
+   - Visit: http://localhost:8080
    - Paste Spotify or YouTube link
    - Click Download
 
@@ -121,8 +122,8 @@ docker exec vibe ls /root/.config/spotdl/deno
    - Build → Build APK(s)
 
 3. **Mobile Access** (Optional)
-   - Get PC IP: `ipconfig | findstr IPv4`
-   - Visit: http://PC_IP:8081
+   - Get IP from Server Logs (Startup message)
+   - Visit: http://DEVICE_IP:8080
 
 ---
 

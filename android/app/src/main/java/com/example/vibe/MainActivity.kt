@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_CODE_PERMISSIONS = 101
         private const val TAG = "VibeApp"
         private const val CHANNEL_ID = "vibe_downloads"
-        private const val DEFAULT_URL = "http://10.0.0.251:8081/"
+        private const val DEFAULT_URL = "http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/"
         private const val PREF_KEY_URL = "server_url"
     }
 
@@ -89,7 +89,7 @@ class MainActivity : AppCompatActivity() {
     private fun showUrlDialog() {
         val builder = AlertDialog.Builder(this)
         builder.setTitle("Switch Server")
-        builder.setMessage("Enter the new Cloud URL (e.g., https://vibe.render.com/)")
+        builder.setMessage("Enter the new Cloud URL (e.g., http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/)")
 
         val input = EditText(this)
         input.setText(prefs.getString(PREF_KEY_URL, DEFAULT_URL))
@@ -105,9 +105,11 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Connecting to $newUrl", Toast.LENGTH_SHORT).show()
         }
         builder.setNegativeButton("Cancel") { dialog, _ -> dialog.cancel() }
-        builder.setNeutralButton("Reset to Local") { _, _ ->
-            prefs.edit().putString(PREF_KEY_URL, DEFAULT_URL).apply()
-            webView.loadUrl(DEFAULT_URL)
+        builder.setNeutralButton("Local Termux") { _, _ ->
+            val localUrl = "http://127.0.0.1:8080/"
+            prefs.edit().putString(PREF_KEY_URL, localUrl).apply()
+            webView.loadUrl(localUrl)
+            Toast.makeText(this, "Connecting to Local Termux", Toast.LENGTH_SHORT).show()
         }
 
         builder.show()

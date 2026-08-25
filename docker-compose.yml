@@ -3,7 +3,7 @@ services:
     build: .
     container_name: vibe
     ports:
-      - "8081:8080"
+      - "8080:8080"
     volumes:
       - ./app:/app/app
       - ./downloads:/app/downloads

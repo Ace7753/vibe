@@ -1,6 +1,6 @@
 # Vibe Environment Variables
 
-Use these variables to configure your server when hosting in the cloud (Render, Railway, etc.).
+Use these variables to configure your server when hosting in the cloud (AWS, Render, Railway, etc.).
 
 ## 🎨 UI Configuration
 | Variable | Description | Default |
@@ -26,10 +26,9 @@ Use these variables to configure your server when hosting in the cloud (Render, 
 
 ---
 
-### How to set on Render:
-1. Go to your **Dashboard**.
-2. Select your **Vibe Web Service**.
-3. Go to **Environment**.
-4. Click **Add Environment Variable**.
-5. Enter the Key and Value from the tables above.
-6. Click **Save Changes**.
+### How to set on AWS (App Runner / ECS):
+1. Go to your **AWS Console**.
+2. Select your **Vibe Service**.
+3. Go to **Configuration** or **Environment Variables**.
+4. Add the Key and Value from the tables above.
+5. Apply changes.

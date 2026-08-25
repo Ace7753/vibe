@@ -8,7 +8,7 @@
     "tagline": "Spotify Downloader",
     "accent": "#ff2e88",
     "bg": "#050505",
-    "port": 8081
+    "port": 8080
 }
 ```
 
@@ -26,7 +26,7 @@ Edit: `vibe/vibe-config.json`
     "tagline": "Your tagline here",
     "accent": "#YOUR_COLOR",
     "bg": "#YOUR_BG_COLOR",
-    "port": 8081
+    "port": 8080
 }
 ```
 
@@ -37,7 +37,7 @@ docker compose restart
 
 ### Option 2: Via Web Admin Panel (No Restart)
 
-1. Go to: http://localhost:8081
+1. Go to: http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/
 2. Click settings icon (bottom right)
 3. Edit title, tagline, colors
 4. Click "Save"
@@ -73,7 +73,7 @@ vibe/vibe-config.json
 ✓ Tagline: **Spotify Downloader**
 ✓ Accent: **#ff2e88** (Pink)
 ✓ Background: **#050505** (Black)
-✓ Port: **8081**
+✓ Port: **8080**
 
 ---
 
@@ -85,7 +85,7 @@ vibe/vibe-config.json
 | tagline | Subtitle/description |
 | accent | Pink color for buttons & highlights |
 | bg | Dark background color |
-| port | Server port (8081) |
+| port | Server port (8080) |
 
 ---
 
