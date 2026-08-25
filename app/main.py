@@ -236,7 +236,7 @@ async def index():
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6 pb-32">
         <header class="mb-12 flex justify-between items-start">
             <div class="flex items-center gap-4">
-                <img src="/assets/vibe_icon_original.png" class="w-16 h-16 rounded-2xl shadow-2xl" alt="Logo">
+                <img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl" alt="Logo">
                 <div>
                     <h1 id="vibe-logo" class="text-3xl font-black tracking-tighter">{c['title']}</h1>
                     <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
