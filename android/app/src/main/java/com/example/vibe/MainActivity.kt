@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_CODE_PERMISSIONS = 101
         private const val TAG = "VibeApp"
         private const val CHANNEL_ID = "vibe_downloads"
-        private const val DEFAULT_URL = "http://10.0.0.228:8080/"
+        private const val DEFAULT_URL = "http://vibe-alb-1651997055.us-east-1.elb.amazonaws.com/"
         private const val PREF_KEY_URL = "server_url"
     }
 
