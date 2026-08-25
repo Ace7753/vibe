@@ -7,6 +7,7 @@
     </base-config>
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="true">vibe-alb-1651997055.us-east-1.elb.amazonaws.com</domain>
+        <domain includeSubdomains="true">10.0.0.228</domain>
         <domain includeSubdomains="true">127.0.0.1</domain>
         <domain includeSubdomains="true">10.0.2.2</domain>
     </domain-config>
