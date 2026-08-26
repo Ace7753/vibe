@@ -75,12 +75,18 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
     is_playlist = "/playlist/" in query
     output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
+
+    # NO-DENO STEALTH ENGINE CONFIG
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
-        "--output", str(DOWNLOAD_DIR / output_template), "--format", "m4a",
-        "--threads", "1", "--search-query", "{artist} - {title}",
-        "--yt-dlp-args", "--impersonate chrome --geo-bypass"
+        "--output", str(DOWNLOAD_DIR / output_template),
+        "--format", "m4a",
+        "--threads", "1",
+        "--search-query", "{artist} - {title}",
+        "--audio", "youtube-music", "piped", "soundcloud", "youtube",
+        "--yt-dlp-args", "--impersonate chrome --geo-bypass --no-check-certificate --quiet"
     ]
+
     if is_playlist: cmd.append("--playlist-numbering")
     if COOKIE_FILE.exists(): cmd.extend(["--cookie-file", str(COOKIE_FILE)])
 
@@ -109,7 +115,7 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
     base_url = str(request.base_url).rstrip('/')
-    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Starting..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting (No-Deno Mode)..."], "zip_url": None}
     asyncio.create_task(run_spotdl(job_id, query, base_url))
     return {"job_id": job_id}
 

@@ -4,11 +4,11 @@
     "accent": "#ff2e88",
     "bg": "#050505",
     "port": 8080,
-    "deno_enabled": true,
+    "deno_enabled": false,
     "features": {
         "spotify_downloads": true,
         "youtube_downloads": true,
-        "deno_support": true,
+        "deno_support": false,
         "batch_downloads": true
     }
 }
