@@ -17,11 +17,10 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python packages
-# spotdl v4.5.2 is the required hotfix for July/August 2026
-# Adding curl-cffi for yt-dlp impersonation support (Stealth Mode)
+# Forcing yt-dlp master branch for the absolute latest August 2026 bypasses
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
+    pip install --no-cache-dir spotdl==4.5.2 "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" ytmusicapi>=1.12.1 curl-cffi
 
 # Install Deno (required for modern YouTube decryption on cloud IPs)
 RUN spotdl --download-deno

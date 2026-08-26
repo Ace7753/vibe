@@ -84,8 +84,8 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
     output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
 
     # --- THE AWS NUCLEAR BYPASS (AUGUST 2026) ---
-    # 1. We use player_client=ios which is the current weakest bot check
-    # 2. We lead with soundcloud/youtube-music for lookup stability
+    # 1. We prioritize YouTube Music/YouTube now that cookies are confirmed working
+    # 2. Optimized yt-dlp args for better compatibility across sites
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
@@ -93,8 +93,8 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
         "--bitrate", "disable",
         "--threads", "4",
         "--search-query", "{artist} - {title}",
-        "--audio", "soundcloud", "youtube-music", "piped", "youtube",
-        "--yt-dlp-args", "--impersonate chrome --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=ios,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
+        "--audio", "youtube-music", "youtube", "soundcloud", "piped",
+        "--yt-dlp-args", "--geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=ios,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
     ]
 
     if is_playlist: cmd.append("--playlist-numbering")
