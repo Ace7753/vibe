@@ -139,7 +139,8 @@ async def index():
 </head>
 <body>
     <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h1>{c['title']}</h1>
+        <img src="/assets/vibe_icon_original.png" style="width:50px; height:50px; border-radius:10px; margin-right:15px;">
+        <h1 style="flex:1;">{c['title']}</h1>
         <button onclick="clearAll()" class="btn" style="background:#444; color:white; font-size:10px;">CLEAR ALL</button>
     </div>
     <p>{c['tagline']}</p>
