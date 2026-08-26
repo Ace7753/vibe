@@ -29,16 +29,14 @@ RUN spotdl --download-deno
 # Create directories
 RUN mkdir -p downloads archives
 
-# Copy app and cookies
+# Copy app
 COPY app ./app
-COPY cookies.txt .
-RUN chmod 644 cookies.txt
 
-# Diagnostic: List files to ensure cookies.txt is present
+# Diagnostic: List files
 RUN ls -la /app
 
 # Expose port
 EXPOSE 8080
 
-# Run
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run with python -u to ensure logs are flushed immediately for AWS monitoring
+CMD ["python", "-u", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
