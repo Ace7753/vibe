@@ -53,7 +53,8 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_CODE_PERMISSIONS = 101
         private const val TAG = "VibeApp"
         private const val CHANNEL_ID = "vibe_downloads"
-        private const val DEFAULT_URL = "http://10.0.0.228:8080/"
+        // Universal default for local Termux execution
+        private const val DEFAULT_URL = "http://127.0.0.1:8080/"
         private const val PREF_KEY_URL = "server_url"
     }
 
@@ -76,10 +77,6 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Loading Vibe UI: $savedUrl")
         webView.loadUrl(savedUrl)
 
-        // Secret URL Switcher: Long click handler
-        // Note: In WebView, we need to handle clicks on the WebView itself or a specific element.
-        // For simplicity, we can use a dedicated secret gesture if the user wants.
-        // Let's use a long click on the WebView as a fallback.
         webView.setOnLongClickListener {
             showUrlDialog()
             true
@@ -99,12 +96,10 @@ class MainActivity : AppCompatActivity() {
             var newUrl = input.text.toString().trim()
             if (!newUrl.startsWith("http")) newUrl = "http://$newUrl"
             
-            // --- THE HTTPS LOCAL FIX ---
-            // Local engines (127.0.0.1, 10.0.0.x) don't support HTTPS.
-            // If the user typed https, we force it back to http so it actually works.
-            if (newUrl.startsWith("https://") && (newUrl.contains("127.0.0.1") || newUrl.contains("10.0.0.228"))) {
+            // --- UNIVERSAL HTTPS BYPASS ---
+            // Local engines don't support HTTPS. If user types it, force it back to HTTP.
+            if (newUrl.startsWith("https://") && (newUrl.contains("127.0.0.1") || newUrl.contains("localhost") || newUrl.contains("10.0.0."))) {
                 newUrl = newUrl.replace("https://", "http://")
-                Toast.makeText(this, "Forced HTTP for local engine", Toast.LENGTH_SHORT).show()
             }
             
             if (!newUrl.endsWith("/")) newUrl = "$newUrl/"
@@ -114,7 +109,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Connecting to $newUrl", Toast.LENGTH_SHORT).show()
         }
         builder.setNegativeButton("Cancel") { dialog, _ -> dialog.cancel() }
-        builder.setNeutralButton("Reset to Local") { _, _ ->
+        builder.setNeutralButton("Reset Default") { _, _ ->
             prefs.edit().putString(PREF_KEY_URL, DEFAULT_URL).apply()
             webView.loadUrl(DEFAULT_URL)
             Toast.makeText(this, "Reset to Local Default", Toast.LENGTH_SHORT).show()
@@ -173,12 +168,22 @@ class MainActivity : AppCompatActivity() {
                 progressBar.visibility = View.GONE
             }
 
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                val url = request?.url.toString()
+                // Force HTTP for local addresses to prevent accidental HTTPS upgrades
+                if (url.startsWith("https://") && (url.contains("127.0.0.1") || url.contains("localhost") || url.contains("10.0.0."))) {
+                    val fixedUrl = url.replace("https://", "http://")
+                    view?.loadUrl(fixedUrl)
+                    return true
+                }
+                return false
+            }
+
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                 if (request?.isForMainFrame == true) {
                     Log.e(TAG, "Connection Error: ${error?.description}")
-                    // Show dialog if connection fails, so user can fix URL
-                    if (error?.errorCode == -6 || error?.errorCode == -2) { // Connection refused or Name not resolved
-                         Toast.makeText(this@MainActivity, "Could not reach server. Long-press screen to change URL.", Toast.LENGTH_LONG).show()
+                    if (error?.errorCode == -6 || error?.errorCode == -2) {
+                         Toast.makeText(this@MainActivity, "Server Offline. Ensure Termux/PC engine is running.", Toast.LENGTH_LONG).show()
                     }
                 }
             }
