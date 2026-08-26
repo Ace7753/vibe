@@ -1,0 +1,31 @@
+{
+    "containerDefinitions": [
+        {
+            "name": "vibe-container",
+            "image": "020033178044.dkr.ecr.us-east-1.amazonaws.com/vibe:latest",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [],
+            "mountPoints": [],
+            "volumesFrom": [],
+            "systemControls": []
+        }
+    ],
+    "family": "vibe-task",
+    "executionRoleArn": "arn:aws:iam::020033178044:role/vibe-execution-role",
+    "networkMode": "awsvpc",
+    "volumes": [],
+    "placementConstraints": [],
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "512",
+    "memory": "1024"
+}

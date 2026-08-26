@@ -29,8 +29,10 @@ RUN spotdl --download-deno
 # Create directories
 RUN mkdir -p downloads archives
 
-# Copy app
+# Copy app and assets
 COPY app ./app
+COPY vibe_icon_original.png .
+COPY vibe-config.json .
 
 # Diagnostic: List files
 RUN ls -la /app
