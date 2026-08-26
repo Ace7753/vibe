@@ -24,6 +24,11 @@ COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 for d in [DOWNLOAD_DIR, ARCHIVE_DIR]: d.mkdir(exist_ok=True)
 
+# --- COOKIE INJECTION ---
+vibe_cookies_env = os.getenv("VIBE_COOKIES")
+if vibe_cookies_env:
+    COOKIE_FILE.write_text(vibe_cookies_env)
+
 # --- CONFIG ---
 DEFAULT_CONFIG = {
     "title": "Vibe",
@@ -51,7 +56,6 @@ app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
 # --- ENGINE ---
 async def get_metadata(query: str):
-    """Fetch metadata for ZIP naming"""
     temp_meta = BASE_DIR / f"meta_{uuid.uuid4().hex}.spotdl"
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -68,12 +72,8 @@ async def get_metadata(query: str):
                 artist = first.get("artist", "Unknown")
                 album = first.get("album_name", "Unknown")
                 name = first.get("name", "Unknown")
-
-                if "/playlist/" in query:
-                    # spotDL doesn't easily give playlist name in .spotdl file
-                    return "Playlist"
-                if len(data) > 1: # Album or multiple tracks
-                    return f"{artist} - {album}"
+                if "/playlist/" in query: return "Playlist"
+                if len(data) > 1: return f"{artist} - {album}"
                 return f"{artist} - {name}"
     except: pass
     finally:
@@ -83,51 +83,32 @@ async def get_metadata(query: str):
 async def run_spotdl(job_id: str, query: str, base_url: str):
     job = JOBS[job_id]
     job["status"] = "running"
-
-    # Pre-fetch metadata for ZIP naming
-    job["log"].append("🔍 Fetching metadata for package naming...")
     zip_base_name = await get_metadata(query)
-    job["log"].append(f"📦 Package will be named: {zip_base_name}")
-
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
-
-    # Dynamic Numbering: Only use {list-position} for Playlists
     is_playlist = "/playlist/" in query
     output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
 
+    # --- THE 403 FORBIDDEN NUCLEAR BYPASS ---
+    # We switch to android player client which is less likely to 403 on mobile networks
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
         "--format", "m4a",
         "--bitrate", "disable",
         "--threads", "1",
-        "--log-level", "DEBUG",
         "--search-query", "{artist} - {title}",
-        "--yt-dlp-args", "--impersonate chrome --rm-cache-dir --geo-bypass",
-        "--audio", "youtube", "piped", "soundcloud", "youtube-music"
+        "--audio", "youtube-music", "piped", "soundcloud", "youtube", # YouTube-Music leads now
+        "--yt-dlp-args", "--impersonate chrome --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=android,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
     ]
 
-    if is_playlist:
-        cmd.append("--playlist-numbering")
-        job["log"].append("🔢 Playlist detected: Adding numbering")
-
-    if COOKIE_FILE.exists():
-        cmd.extend(["--cookie-file", str(COOKIE_FILE)])
-        job["log"].append(f"🎫 Cookies applied ({COOKIE_FILE.stat().st_size} bytes)")
-    else:
-        job["log"].append("⚠️ No cookies.txt found! Downloads might fail.")
+    if is_playlist: cmd.append("--playlist-numbering")
+    if COOKIE_FILE.exists(): cmd.extend(["--cookie-file", str(COOKIE_FILE)])
 
     env = os.environ.copy()
     env["SPOTDL_CACHE_DIR"] = str(BASE_DIR)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env
-        )
-        assert proc.stdout
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
         while True:
             line = await proc.stdout.readline()
             if not line: break
@@ -135,18 +116,15 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
             if msg: job["log"].append(msg); job["log"] = job["log"][-100:]
         rc = await proc.wait()
         job["status"] = "complete" if rc == 0 else "failed"
-
         if rc == 0:
             after = {f.name for f in DOWNLOAD_DIR.glob("*")}
             new_files = list(after - before)
             if new_files:
-                # Clean filename for ZIP
                 safe_name = "".join([c for c in zip_base_name if c.isalnum() or c in (' ', '-', '_')]).strip()
                 zip_name = f"{safe_name}_{job_id[:4]}.zip"
                 with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
                     for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
                 job["zip_url"] = f"{base_url}/archives/{zip_name}"
-                job["log"].append(f"✅ Created ZIP: {zip_name}")
     except Exception as e:
         job["status"] = "failed"; job["log"].append(f"Error: {str(e)}")
 
@@ -161,7 +139,7 @@ async def get_cfg(): return SITE_CONFIG
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
     base_url = str(request.base_url).rstrip('/')
-    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting (Bypass Mode)..."], "zip_url": None}
     asyncio.create_task(run_spotdl(job_id, query, base_url))
     return {"job_id": job_id}
 
@@ -181,23 +159,9 @@ async def list_files(request: Request):
 
 @app.post("/api/clear")
 async def clear_downloads():
-    """Wipe downloads and archives"""
-    try:
-        count = 0
-        for folder in [DOWNLOAD_DIR, ARCHIVE_DIR]:
-            for item in folder.glob("*"):
-                if item.is_file():
-                    item.unlink()
-                    count += 1
-        return {"status": "ok", "cleared": count}
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
-@app.post("/api/config")
-async def update_config(token: str = Form(...), title: str = Form(...), tagline: str = Form(...), accent: str = Form(...), bg: str = Form(...)):
-    if token != MASTER_TOKEN: raise HTTPException(401)
-    SITE_CONFIG.update({"title": title, "tagline": tagline, "accent": accent, "bg": bg})
-    CONFIG_FILE.write_text(json.dumps(SITE_CONFIG, indent=4))
+    for folder in [DOWNLOAD_DIR, ARCHIVE_DIR]:
+        for item in folder.glob("*"):
+            if item.is_file(): item.unlink()
     return {"status": "ok"}
 
 # --- UI ---
@@ -252,19 +216,16 @@ async def index():
             </div>
             <div id="status-card" class="glass rounded-2xl p-8">
                 <div class="flex justify-between mb-4"><span class="text-xs opacity-40 uppercase tracking-widest font-bold">Progress</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
-
                 <div class="space-y-4">
                     <p id="activity-text" class="text-sm font-bold opacity-80 truncate">Waiting for input...</p>
                     <div class="w-full bg-white/5 rounded-full h-2 overflow-hidden">
                         <div id="progress-bar" class="h-full transition-all duration-500 rounded-full" style="width: 0%; background: {c['accent']}"></div>
                     </div>
                 </div>
-
                 <button onclick="toggleLogs()" class="mt-6 text-[10px] opacity-30 hover:opacity-100 uppercase font-black tracking-tighter transition-all">View Technical Details</button>
                 <div id="engine-log-container" class="hidden mt-4">
                     <div id="engine-log" class="text-[10px] font-mono text-emerald-500/60 h-32 overflow-y-auto leading-tight p-2 bg-black/20 rounded-lg">Ready</div>
                 </div>
-
                 <a id="insta-zip" href="#" class="hidden mt-4 w-full block bg-cyan-500/10 text-center py-3 rounded-xl font-bold text-cyan-400 border border-cyan-500/20">📦 Download Pack Your Files</a>
             </div>
         </section>
@@ -278,9 +239,7 @@ async def index():
         function toggleLogs() {{ const log = document.getElementById('engine-log-container'); log.classList.toggle('hidden'); }}
         function showPage(p) {{ ['download','files'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
         async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '5%'; document.getElementById('activity-text').innerText = 'Initializing...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
-
         async function clearAll() {{ if(!confirm('Clear all downloads and archives?')) return; await fetch('/api/clear', {{method:'POST'}}); refreshFiles(); alert('Cleared!'); }}
-
         async function pollEngine() {{
             if(!currentJob) return;
             const res = await fetch('/api/jobs/'+currentJob);
@@ -289,11 +248,9 @@ async def index():
             const logElement = document.getElementById('engine-log');
             logElement.innerText = job.log.join('\\n');
             logElement.scrollTop = logElement.scrollHeight;
-
             const lastLines = job.log.slice(-10);
             let progress = 0;
             let activity = "Processing...";
-
             for (const line of lastLines) {{
                 const pctMatch = line.match(/(\\d+(\\.\\d+)?%)/);
                 if (pctMatch) progress = parseFloat(pctMatch[1]);
@@ -304,10 +261,8 @@ async def index():
                 if (line.includes('Searching')) activity = 'Searching for best match...';
                 if (line.includes('Converting')) activity = 'Optimizing audio...';
             }}
-
             if (progress > 0) document.getElementById('progress-bar').style.width = progress + '%';
             document.getElementById('activity-text').innerText = activity;
-
             if(job.status==='running'||job.status==='queued') {{
                 setTimeout(pollEngine, 1000);
             }} else {{
