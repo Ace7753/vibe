@@ -24,11 +24,6 @@ COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 for d in [DOWNLOAD_DIR, ARCHIVE_DIR]: d.mkdir(exist_ok=True)
 
-# --- COOKIE INJECTION ---
-vibe_cookies_env = os.getenv("VIBE_COOKIES")
-if vibe_cookies_env:
-    COOKIE_FILE.write_text(vibe_cookies_env)
-
 # --- CONFIG ---
 DEFAULT_CONFIG = {
     "title": "Vibe",
@@ -88,8 +83,9 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
     is_playlist = "/playlist/" in query
     output_template = "{list-position} - {artist} - {title}.{output-ext}" if is_playlist else "{artist} - {title}.{output-ext}"
 
-    # --- THE 403 FORBIDDEN NUCLEAR BYPASS ---
-    # We switch to android player client which is less likely to 403 on mobile networks
+    # --- THE AWS NUCLEAR BYPASS (AUGUST 2026) ---
+    # 1. We use player_client=ios which is the current weakest bot check
+    # 2. We lead with soundcloud/youtube-music for lookup stability
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
@@ -97,12 +93,23 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
         "--bitrate", "disable",
         "--threads", "4",
         "--search-query", "{artist} - {title}",
-        "--audio", "youtube-music", "piped", "soundcloud", "youtube", # YouTube-Music leads now
-        "--yt-dlp-args", "--impersonate chrome --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=android,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
+        "--audio", "soundcloud", "youtube-music", "piped", "youtube",
+        "--yt-dlp-args", "--impersonate chrome --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=ios,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
     ]
 
     if is_playlist: cmd.append("--playlist-numbering")
-    if COOKIE_FILE.exists(): cmd.extend(["--cookie-file", str(COOKIE_FILE)])
+
+    # Check environment variable first, then file
+    vibe_cookies_env = os.getenv("VIBE_COOKIES")
+    if vibe_cookies_env:
+        COOKIE_FILE.write_text(vibe_cookies_env)
+        job["log"].append("🎫 Cookies injected from VIBE_COOKIES environment.")
+
+    if COOKIE_FILE.exists():
+        cmd.extend(["--cookie-file", str(COOKIE_FILE)])
+        job["log"].append(f"🎫 Cookies applied ({COOKIE_FILE.stat().st_size} bytes)")
+    else:
+        job["log"].append("⚠️ No cookies found. AWS may be blocked. Use Settings to add them!")
 
     env = os.environ.copy()
     env["SPOTDL_CACHE_DIR"] = str(BASE_DIR)
@@ -139,7 +146,7 @@ async def get_cfg(): return SITE_CONFIG
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
     base_url = str(request.base_url).rstrip('/')
-    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting (Bypass Mode)..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting (iOS Bypass)..."], "zip_url": None}
     asyncio.create_task(run_spotdl(job_id, query, base_url))
     return {"job_id": job_id}
 
@@ -163,6 +170,26 @@ async def clear_downloads():
         for item in folder.glob("*"):
             if item.is_file(): item.unlink()
     return {"status": "ok"}
+
+@app.post("/api/save_cookies")
+async def save_cookies(data: dict):
+    cookies = data.get("cookies", "")
+    if cookies:
+        COOKIE_FILE.write_text(cookies)
+        return {"status": "ok"}
+    return {"status": "error"}
+
+@app.post("/api/fix_engine")
+async def fix_engine():
+    # Clear yt-dlp cache on server
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "spotdl", "--clear-cache",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.wait()
+        return {"status": "ok"}
+    except: return {"status": "error"}
 
 # --- UI ---
 @app.get("/", response_class=HTMLResponse)
@@ -189,6 +216,7 @@ async def index():
     <div class="fixed inset-0 pointer-events-none z-0">
         <div class="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full opacity-20 blur-[120px]" style="background: {c['accent']};"></div>
     </div>
+
     <nav class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 glass rounded-full px-6 py-3 flex gap-8 items-center shadow-2xl">
         <button onclick="showPage('download')" id="nav-download" class="nav-active opacity-60 hover:opacity-100 tab-transition">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
@@ -196,7 +224,11 @@ async def index():
         <button onclick="showPage('files')" id="nav-files" class="opacity-60 hover:opacity-100 tab-transition">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5.586a1 1 0 0 1 .707.293l5.414 5.414a1 1 0 0 1 .293.707V19a2 2 0 0 1-2 2z"/></svg>
         </button>
+        <button onclick="showPage('settings')" id="nav-settings" class="opacity-60 hover:opacity-100 tab-transition">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+        </button>
     </nav>
+
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6 pb-32">
         <header class="mb-12 flex justify-between items-start">
             <div class="flex items-center gap-4">
@@ -206,8 +238,12 @@ async def index():
                     <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
                 </div>
             </div>
-            <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Clear All</button>
+            <div class="flex gap-2">
+                 <button onclick="fixEngine()" class="text-[10px] font-black bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Fix Engine</button>
+                 <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Clear All</button>
+            </div>
         </header>
+
         <section id="page-download" class="tab-transition space-y-8">
             <h2 class="text-5xl font-black">Download <span style="color:{c['accent']}">Spotify</span></h2>
             <div class="glass rounded-2xl p-2 flex items-center shadow-2xl">
@@ -229,17 +265,32 @@ async def index():
                 <a id="insta-zip" href="#" class="hidden mt-4 w-full block bg-cyan-500/10 text-center py-3 rounded-xl font-bold text-cyan-400 border border-cyan-500/20">📦 Download Pack Your Files</a>
             </div>
         </section>
+
         <section id="page-files" class="hidden tab-transition space-y-6">
             <h2 class="text-5xl font-black">Your <span style="color:{c['accent']}">Files</span></h2>
             <div id="file-list" class="space-y-3"></div>
         </section>
+
+        <section id="page-settings" class="hidden tab-transition space-y-6">
+            <h2 class="text-5xl font-black">Settings</h2>
+            <div class="glass rounded-2xl p-8 space-y-4">
+                <h3 class="text-xs uppercase font-black opacity-40">Cookie Manager</h3>
+                <p class="text-xs opacity-60">If downloads fail with "Sign in to confirm you're not a bot", paste your cookies.txt text here.</p>
+                <textarea id="cookie-input" class="w-full h-48 bg-black/40 rounded-xl p-4 font-mono text-[10px] outline-none border border-white/10" placeholder="Paste cookies.txt content here..."></textarea>
+                <button onclick="saveCookies()" class="w-full py-3 rounded-xl font-bold accent-bg text-black">Save Cookies</button>
+            </div>
+        </section>
     </main>
+
     <script>
         let currentJob = null;
         function toggleLogs() {{ const log = document.getElementById('engine-log-container'); log.classList.toggle('hidden'); }}
-        function showPage(p) {{ ['download','files'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
+        function showPage(p) {{ ['download','files', 'settings'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
         async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '5%'; document.getElementById('activity-text').innerText = 'Initializing...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
         async function clearAll() {{ if(!confirm('Clear all downloads and archives?')) return; await fetch('/api/clear', {{method:'POST'}}); refreshFiles(); alert('Cleared!'); }}
+        async function saveCookies() {{ const cookies = document.getElementById('cookie-input').value; await fetch('/api/save_cookies', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{cookies}})}}); alert('Cookies Saved!'); }}
+        async function fixEngine() {{ await fetch('/api/fix_engine', {{method:'POST'}}); alert('Engine cache cleared and refreshed!'); }}
+
         async function pollEngine() {{
             if(!currentJob) return;
             const res = await fetch('/api/jobs/'+currentJob);
