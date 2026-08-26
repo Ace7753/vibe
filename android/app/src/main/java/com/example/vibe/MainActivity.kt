@@ -98,6 +98,15 @@ class MainActivity : AppCompatActivity() {
         builder.setPositiveButton("Connect") { _, _ ->
             var newUrl = input.text.toString().trim()
             if (!newUrl.startsWith("http")) newUrl = "http://$newUrl"
+            
+            // --- THE HTTPS LOCAL FIX ---
+            // Local engines (127.0.0.1, 10.0.0.x) don't support HTTPS.
+            // If the user typed https, we force it back to http so it actually works.
+            if (newUrl.startsWith("https://") && (newUrl.contains("127.0.0.1") || newUrl.contains("10.0.0.228"))) {
+                newUrl = newUrl.replace("https://", "http://")
+                Toast.makeText(this, "Forced HTTP for local engine", Toast.LENGTH_SHORT).show()
+            }
+            
             if (!newUrl.endsWith("/")) newUrl = "$newUrl/"
             
             prefs.edit().putString(PREF_KEY_URL, newUrl).apply()
