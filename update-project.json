@@ -1,0 +1,9 @@
+{
+  "name": "vibe-build",
+  "source": {
+    "type": "GITHUB",
+    "location": "https://github.com/Ace7753/vibe.git",
+    "buildspec": "version: 0.2\nphases:\n  pre_build:\n    commands:\n      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 020033178044.dkr.ecr.us-east-1.amazonaws.com\n  build:\n    commands:\n      - docker build -t vibe:latest .\n      - docker tag vibe:latest 020033178044.dkr.ecr.us-east-1.amazonaws.com/vibe:latest\n  post_build:\n    commands:\n      - docker push 020033178044.dkr.ecr.us-east-1.amazonaws.com/vibe:latest\n      - echo Build complete"
+  },
+  "sourceVersion": "main"
+}
