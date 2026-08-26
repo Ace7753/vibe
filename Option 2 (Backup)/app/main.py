@@ -81,7 +81,7 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
         "--format", "m4a",
-        "--threads", "1",
+        "--threads", "4",
         "--search-query", "{artist} - {title}",
         "--audio", "youtube-music", "piped", "soundcloud", "youtube",
         "--yt-dlp-args", "--impersonate chrome --geo-bypass --no-check-certificate --quiet"

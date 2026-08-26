@@ -95,7 +95,7 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
         "--output", str(DOWNLOAD_DIR / output_template),
         "--format", "m4a",
         "--bitrate", "disable",
-        "--threads", "1",
+        "--threads", "4",
         "--search-query", "{artist} - {title}",
         "--audio", "youtube-music", "piped", "soundcloud", "youtube", # YouTube-Music leads now
         "--yt-dlp-args", "--impersonate chrome --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=android,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
