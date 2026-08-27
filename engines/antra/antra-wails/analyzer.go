@@ -1,0 +1,622 @@
+package main
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+var audioExtensions = map[string]bool{
+	".flac": true,
+	".mp3":  true,
+	".m4a":  true,
+	".aac":  true,
+	".alac": true,
+	".wav":  true,
+	".aiff": true,
+	".aif":  true,
+	".ogg":  true,
+}
+
+// Regex patterns for ffmpeg audio analysis output.
+var (
+	reMaxVolume  = regexp.MustCompile(`max_volume:\s*([-\d.]+)\s*dB`)
+	reMeanVolume = regexp.MustCompile(`mean_volume:\s*([-\d.]+)\s*dB`)
+	reLufsI      = regexp.MustCompile(`\bI:\s*([-\d.]+)\s*LUFS`)
+	reLufsLRA    = regexp.MustCompile(`\bLRA:\s*([-\d.]+)\s*LU`)
+	reTruePeak   = regexp.MustCompile(`\bPeak:\s*([-\d.]+)\s*dBTP`)
+)
+
+// AudioStats holds audio quality measurements.
+// A value of -999 means "not measured / unavailable".
+type AudioStats struct {
+	PeakDb     float64 `json:"peakDb"`
+	RmsDb      float64 `json:"rmsDb"`
+	TruePeakDb float64 `json:"truePeakDb"`
+	LufsI      float64 `json:"lufsI"`
+	LufsLRA    float64 `json:"lufsLRA"`
+	CutoffHz   int     `json:"cutoffHz"`
+}
+
+// parseLastFloat finds the last regex match in text and returns it as float64.
+// Returns (0, false) on no match, parse error, ±Inf, or NaN.
+func parseLastFloat(re *regexp.Regexp, text string) (float64, bool) {
+	matches := re.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return 0, false
+	}
+	last := matches[len(matches)-1]
+	v, err := strconv.ParseFloat(last[1], 64)
+	if err != nil || math.IsInf(v, 0) || math.IsNaN(v) {
+		return 0, false
+	}
+	return v, true
+}
+
+// runAudioStats measures peak, RMS, LUFS-I, LRA, and true peak.
+func runAudioStats(filePath, ffmpegExe string) (*AudioStats, error) {
+	cmd := exec.Command(
+		resolveExe(ffmpegExe, "ffmpeg"),
+		"-i", filePath,
+		"-af", "volumedetect,ebur128=peak=true",
+		"-f", "null", "-",
+	)
+	hideProcess(cmd)
+	out, _ := cmd.CombinedOutput() // ffmpeg exits non-zero for -f null
+
+	text := string(out)
+	stats := &AudioStats{
+		PeakDb:     -999,
+		RmsDb:      -999,
+		TruePeakDb: -999,
+		LufsI:      -999,
+		LufsLRA:    -999,
+	}
+
+	if v, ok := parseLastFloat(reMaxVolume, text); ok {
+		stats.PeakDb = v
+	}
+	if v, ok := parseLastFloat(reMeanVolume, text); ok {
+		stats.RmsDb = v
+	}
+	if v, ok := parseLastFloat(reLufsI, text); ok {
+		stats.LufsI = v
+	}
+	if v, ok := parseLastFloat(reLufsLRA, text); ok {
+		stats.LufsLRA = v
+	}
+	if v, ok := parseLastFloat(reTruePeak, text); ok {
+		stats.TruePeakDb = v
+	}
+
+	return stats, nil
+}
+
+// measureRMSAboveFreq applies a highpass at freqHz to a 30-second window
+// starting at startSec and returns the mean RMS level.
+func measureRMSAboveFreq(filePath, ffmpegExe string, freqHz int, startSec float64) (float64, bool) {
+	cmd := exec.Command(
+		resolveExe(ffmpegExe, "ffmpeg"),
+		"-ss", fmt.Sprintf("%.1f", startSec),
+		"-i", filePath,
+		"-t", "30",
+		"-af", fmt.Sprintf("highpass=f=%d:poles=2,volumedetect", freqHz),
+		"-f", "null", "-",
+	)
+	hideProcess(cmd)
+	out, _ := cmd.CombinedOutput()
+	return parseLastFloat(reMeanVolume, string(out))
+}
+
+// detectFrequencyCutoff estimates the highest frequency that still contains
+// significant audio content (within 42 dB of the full-spectrum RMS baseline).
+// Returns 0 when detection is unreliable (e.g., near-silent content).
+func detectFrequencyCutoff(filePath, ffmpegExe string, durationSec float64) int {
+	// Skip into the track to avoid silent intros
+	startSec := durationSec * 0.1
+	if startSec > 10 {
+		startSec = 10
+	}
+	if durationSec < 10 {
+		startSec = 0
+	}
+
+	// Baseline: full-spectrum RMS
+	baseCmd := exec.Command(
+		resolveExe(ffmpegExe, "ffmpeg"),
+		"-ss", fmt.Sprintf("%.1f", startSec),
+		"-i", filePath,
+		"-t", "30",
+		"-af", "volumedetect",
+		"-f", "null", "-",
+	)
+	hideProcess(baseCmd)
+	baseOut, _ := baseCmd.CombinedOutput()
+	baselineRMS, ok := parseLastFloat(reMeanVolume, string(baseOut))
+	if !ok || baselineRMS < -60 {
+		return 0 // near-silent — unreliable
+	}
+
+	threshold := baselineRMS - 42.0
+
+	// Probe frequencies in parallel (lowest → highest, so we check full range)
+	freqs := []int{8000, 12000, 16000, 17000, 19000, 21000}
+	type probeResult struct {
+		freq int
+		rms  float64
+		ok   bool
+	}
+	results := make([]probeResult, len(freqs))
+	var wg sync.WaitGroup
+	for i, f := range freqs {
+		wg.Add(1)
+		go func(idx, freq int) {
+			defer wg.Done()
+			rms, ok := measureRMSAboveFreq(filePath, ffmpegExe, freq, startSec)
+			results[idx] = probeResult{freq, rms, ok}
+		}(i, f)
+	}
+	wg.Wait()
+
+	// Highest frequency that still has content above the threshold
+	cutoff := 0
+	for _, r := range results {
+		if r.ok && r.rms > threshold && r.freq > cutoff {
+			cutoff = r.freq
+		}
+	}
+	return cutoff
+}
+
+// extractSampleRate pulls the audio sample rate from a ffprobe result map.
+// Returns 0 when unknown so the caller can apply its own default.
+func extractSampleRate(probe map[string]interface{}) int {
+	if probe == nil {
+		return 0
+	}
+	streams, ok := probe["streams"].([]interface{})
+	if !ok {
+		return 0
+	}
+	for _, s := range streams {
+		sm, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if ct, _ := sm["codec_type"].(string); ct != "audio" {
+			continue
+		}
+		switch v := sm["sample_rate"].(type) {
+		case string:
+			var sr int
+			if _, err := fmt.Sscanf(v, "%d", &sr); err == nil {
+				return sr
+			}
+		case float64:
+			return int(v)
+		}
+	}
+	return 0
+}
+
+// extractDuration pulls the audio duration from a ffprobe result map.
+func extractDuration(probe map[string]interface{}) float64 {
+	if probe == nil {
+		return 0
+	}
+	fmtMap, ok := probe["format"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	durStr, ok := fmtMap["duration"].(string)
+	if !ok {
+		return 0
+	}
+	d, _ := strconv.ParseFloat(durStr, 64)
+	return d
+}
+
+// ScanFolder returns sorted audio file paths from a directory (non-recursive).
+// Returns an empty slice (not nil) on error so the frontend always gets an array.
+func (a *App) ScanFolder(folderPath string) []string {
+	var files []string
+
+	_ = filepath.WalkDir(folderPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		// Only recurse one level into the dropped folder itself
+		if d.IsDir() && path != folderPath {
+			rel, relErr := filepath.Rel(folderPath, path)
+			if relErr == nil && strings.ContainsRune(rel, os.PathSeparator) {
+				return fs.SkipDir
+			}
+		}
+		if !d.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			if audioExtensions[ext] {
+				files = append(files, filepath.ToSlash(path))
+			}
+		}
+		return nil
+	})
+
+	sort.Strings(files)
+	if files == nil {
+		return []string{}
+	}
+	return files
+}
+
+// AnalyzeAudio runs ffprobe for metadata, ffmpeg showspectrumpic for the
+// spectrogram, and ffmpeg audio filters for quality statistics (peak, RMS,
+// LUFS, LRA, true peak, frequency cutoff).
+// Probe, spectrogram, and stats run concurrently; cutoff detection runs after
+// the probe returns a duration.
+func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	// Blocks only if the startup resolution has not finished yet; otherwise free.
+	a.ensureFfmpegPaths()
+	a.mu.Lock()
+	ffmpegExe := a.ffmpegExe
+	ffprobeExe := a.ffprobeExe
+	a.mu.Unlock()
+
+	backend, backendErr := ensureBundledBackend()
+
+	var (
+		probe    map[string]interface{}
+		probeErr error
+		spec     string
+		specErr  error
+		stats    *AudioStats
+	)
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	// ── Probe ──────────────────────────────────────────────────────────────────
+	go func() {
+		defer wg.Done()
+		if backendErr != nil {
+			probe, probeErr = runFFProbe(filePath, ffprobeExe)
+			return
+		}
+		probeCmd := exec.Command(backend, "--probe", filePath)
+		hideProcess(probeCmd)
+		out, err := probeCmd.Output()
+		if err != nil {
+			probeErr = err
+			return
+		}
+		var p map[string]interface{}
+		if jsonErr := json.Unmarshal(out, &p); jsonErr != nil {
+			probeErr = fmt.Errorf("invalid probe JSON: %w", jsonErr)
+			return
+		}
+		if errMsg, ok := p["error"].(string); ok {
+			probeErr = fmt.Errorf("%s", errMsg)
+		} else {
+			probe = p
+		}
+	}()
+
+	// ── Spectrogram ────────────────────────────────────────────────────────────
+	go func() {
+		defer wg.Done()
+		if backendErr != nil {
+			spec, specErr = generateSpectrogram(filePath, ffmpegExe)
+			return
+		}
+		specCmd := exec.Command(backend, "--spectrogram", filePath)
+		hideProcess(specCmd)
+		out, err := specCmd.Output()
+		if err != nil {
+			specErr = err
+			return
+		}
+		var specResult map[string]interface{}
+		if jsonErr := json.Unmarshal(out, &specResult); jsonErr != nil {
+			specErr = fmt.Errorf("invalid spectrogram JSON: %w", jsonErr)
+			return
+		}
+		if errMsg, ok := specResult["error"].(string); ok {
+			specErr = fmt.Errorf("%s", errMsg)
+		} else if data, ok := specResult["data"].(string); ok {
+			spec = "data:image/png;base64," + data
+		}
+	}()
+
+	// ── Audio stats (always use cached ffmpegExe) ──────────────────────────────
+	go func() {
+		defer wg.Done()
+		stats, _ = runAudioStats(filePath, ffmpegExe)
+	}()
+
+	wg.Wait()
+
+	// ── Spectral analysis (v1.1.8 FEAT-5) ──────────────────────────────────────
+	// Real FFT pass, replacing the old six-point frequency probe which could only
+	// ever return one of {8k,12k,16k,17k,19k,21k} and carried no confidence.
+	// Runs after the probe so we have duration + sample rate.
+	if stats != nil {
+		durationSec := extractDuration(probe)
+		sampleRate := extractSampleRate(probe)
+		spectral, sErr := analyseSpectrum(filePath, ffmpegExe, sampleRate, durationSec)
+		if sErr != nil {
+			result["spectralError"] = sErr.Error()
+			// Fall back to the legacy coarse probe so the panel is never empty —
+			// but it is clearly labelled low-confidence downstream.
+			stats.CutoffHz = detectFrequencyCutoff(filePath, ffmpegExe, durationSec)
+		} else {
+			stats.CutoffHz = spectral.CutoffHz
+			result["spectral"] = spectral
+		}
+	}
+
+	// ── Build result ───────────────────────────────────────────────────────────
+	if probeErr != nil {
+		result["probeError"] = probeErr.Error()
+	} else if probe != nil {
+		result["probe"] = probe
+	}
+
+	if specErr != nil {
+		result["spectrogramError"] = specErr.Error()
+	} else if spec != "" {
+		result["spectrogram"] = spec
+	}
+
+	if stats != nil {
+		result["stats"] = stats
+	}
+
+	return result
+}
+
+// ─── Lyrics ───────────────────────────────────────────────────────────────────
+
+// LyricsLine holds a single line of lyrics with its playback offset.
+// TimeMs == -1 means the line has no timestamp (plain-text lyrics).
+type LyricsLine struct {
+	TimeMs int64  `json:"time_ms"`
+	Text   string `json:"text"`
+}
+
+// TrackLyrics is the payload returned by GetTrackLyrics.
+type TrackLyrics struct {
+	Lines  []LyricsLine `json:"lines"`
+	Synced bool         `json:"synced"`
+}
+
+// reLRCTimestamp matches a standard LRC timestamp: [MM:SS.cc] or [MM:SS.xxx]
+// The minute field may be more than two digits.
+var reLRCTimestamp = regexp.MustCompile(`^\[(\d+):(\d{2})\.(\d{2,3})\](.*)$`)
+
+// parseLRC converts raw LRC text into a sorted slice of LyricsLine.
+// Lines that have no timestamp (metadata tags like [ti:…], [ar:…]) are skipped.
+func parseLRC(raw string) []LyricsLine {
+	var lines []LyricsLine
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimRight(line, "\r")
+		m := reLRCTimestamp.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		mins, _ := strconv.ParseInt(m[1], 10, 64)
+		secs, _ := strconv.ParseInt(m[2], 10, 64)
+		frac := m[3]
+		var ms int64
+		if len(frac) == 2 {
+			// centiseconds → milliseconds
+			cs, _ := strconv.ParseInt(frac, 10, 64)
+			ms = cs * 10
+		} else {
+			ms, _ = strconv.ParseInt(frac, 10, 64)
+		}
+		timeMs := (mins*60+secs)*1000 + ms
+		text := strings.TrimSpace(m[4])
+		if text != "" {
+			lines = append(lines, LyricsLine{TimeMs: timeMs, Text: text})
+		}
+	}
+	// LRC files are usually already sorted but guarantee it anyway.
+	sort.Slice(lines, func(i, j int) bool { return lines[i].TimeMs < lines[j].TimeMs })
+	return lines
+}
+
+// lyricsTagKeys lists the tag names Antra checks, in preference order.
+// Different taggers and formats use different casing / names.
+var lyricsTagKeys = []string{
+	"LYRICS", "lyrics", "Lyrics",
+	"SYNCEDLYRICS", "syncedlyrics",
+	"UNSYNCEDLYRICS", "unsyncedlyrics",
+	"LYRICS:LYRICS",
+}
+
+// GetTrackLyrics reads embedded lyrics from filePath via ffprobe and returns
+// a JSON-encoded TrackLyrics.  Returns {"lines":[],"synced":false} on any error
+// or when no lyrics tag is found so the frontend always gets valid JSON.
+func (a *App) GetTrackLyrics(filePath string) string {
+	a.ensureFfmpegPaths()
+	a.mu.Lock()
+	ffprobeExe := a.ffprobeExe
+	a.mu.Unlock()
+
+	// ffprobe is NOT guaranteed to exist: imageio_ffmpeg — the source of our
+	// bundled binary — ships ffmpeg only. So on a machine with no system
+	// ffprobe this call cannot succeed, and before the fallback below the
+	// player simply showed no lyrics with no error anywhere. The backend's
+	// --probe has its own mutagen fallback and reads the same tags.
+	readTags := func() map[string]string {
+		cmd := exec.Command(
+			resolveExe(ffprobeExe, "ffprobe"),
+			"-v", "quiet",
+			"-print_format", "json",
+			"-show_format",
+			filePath,
+		)
+		hideProcess(cmd)
+		out, err := cmd.Output()
+		if err != nil {
+			backend, bErr := ensureBundledBackend()
+			if bErr != nil {
+				return nil
+			}
+			probeCmd := exec.Command(backend, "--probe", filePath)
+			hideProcess(probeCmd)
+			if out, err = probeCmd.Output(); err != nil {
+				return nil
+			}
+		}
+		var probe struct {
+			Format struct {
+				Tags map[string]string `json:"tags"`
+			} `json:"format"`
+		}
+		if err := json.Unmarshal(out, &probe); err != nil {
+			return nil
+		}
+		return probe.Format.Tags
+	}
+
+	tags := readTags()
+	raw := ""
+	for _, k := range lyricsTagKeys {
+		if v, ok := tags[k]; ok && strings.TrimSpace(v) != "" {
+			raw = v
+			break
+		}
+	}
+	if raw == "" {
+		return `{"lines":[],"synced":false}`
+	}
+
+	lrcLines := parseLRC(raw)
+	var result TrackLyrics
+	if len(lrcLines) > 0 {
+		result.Synced = true
+		result.Lines = lrcLines
+	} else {
+		// Plain-text lyrics — one entry per non-empty line, TimeMs = -1.
+		result.Synced = false
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimRight(line, "\r")
+			result.Lines = append(result.Lines, LyricsLine{TimeMs: -1, Text: line})
+		}
+	}
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return `{"lines":[],"synced":false}`
+	}
+	return string(encoded)
+}
+
+// PickAnalyzerFiles opens a multi-file picker filtered to audio files.
+func (a *App) PickAnalyzerFiles() []string {
+	// Wails OpenMultipleFilesDialog expects a slice of FileFilter
+	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Audio Files",
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.aac;*.alac;*.wav;*.aiff;*.aif;*.ogg"},
+		},
+	})
+	if err != nil || len(files) == 0 {
+		return []string{}
+	}
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = filepath.ToSlash(f)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// WriteFile writes raw bytes (base64-encoded) to a file path on disk.
+// Used by the analyzer "Export All" to save PNGs directly to the chosen folder.
+func (a *App) WriteFile(filePath string, base64Data string) error {
+	data, err := base64.StdEncoding.DecodeString(base64Data)
+	if err != nil {
+		return fmt.Errorf("base64 decode: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+	return os.WriteFile(filePath, data, 0644)
+}
+
+// ─── ffprobe ──────────────────────────────────────────────────────────────────
+
+// resolveExe returns exePath if non-empty, otherwise falls back to name (looked up via PATH).
+func resolveExe(exePath, name string) string {
+	if exePath != "" {
+		return exePath
+	}
+	return name
+}
+
+func runFFProbe(filePath, ffprobeExe string) (map[string]interface{}, error) {
+	cmd := exec.Command(
+		resolveExe(ffprobeExe, "ffprobe"),
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		"-show_streams",
+		"-select_streams", "a:0",
+		filePath,
+	)
+	hideProcess(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ffprobe: %w", err)
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(output, &data); err != nil {
+		return nil, fmt.Errorf("ffprobe json: %w", err)
+	}
+	return data, nil
+}
+
+// ─── Spectrogram ──────────────────────────────────────────────────────────────
+
+func generateSpectrogram(filePath, ffmpegExe string) (string, error) {
+	tmpFile := filePath + ".__spec__.png"
+	defer os.Remove(tmpFile)
+
+	cmd := exec.Command(
+		resolveExe(ffmpegExe, "ffmpeg"),
+		"-y",
+		"-i", filePath,
+		"-lavfi", "showspectrumpic=s=1400x400:mode=combined:legend=1:color=viridis:scale=log:gain=4",
+		"-frames:v", "1",
+		tmpFile,
+	)
+	hideProcess(cmd)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ffmpeg: %w — %s", err, strings.TrimSpace(string(out)))
+	}
+
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		return "", fmt.Errorf("read spectrogram: %w", err)
+	}
+
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
+}

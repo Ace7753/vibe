@@ -1,0 +1,1133 @@
+"""
+Metadata fetchers for non-Spotify streaming URLs.
+
+These fetchers normalize TIDAL, Qobuz, and Deezer album/playlist/track links into
+TrackMetadata so the existing Antra resolver/download engine can process them.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+import requests
+
+from antra.core.config import Config
+from antra.core.models import TrackMetadata
+
+
+def _mirror_key(cfg) -> str:
+    """Key used to authenticate metadata calls against the VPS mirrors.
+
+    Deliberately the SAME resolver the download path uses
+    (`service._resolve_mirror_api_key`): validated-supporter key -> manifest key
+    -> the user's personal key.
+
+    These two fetchers used to hand-roll their own two-source chain, in opposite
+    orders to each other, and neither consulted ANTRA_MIRROR_API_KEY. When the Go
+    layer supplies the endpoints it also sets ANTRA_ENDPOINT_MANIFEST_DISABLED=1,
+    so the manifest is read from cache only -- and on any machine where that
+    cache was unreadable BOTH sources came back empty, the X-API-Key header was
+    omitted entirely, and the mirror answered `401 API key required`. That is a
+    MISSING credential, not a rejected one (a bad key answers 403), which is why
+    it read like a server outage.
+
+    Imported lazily: antra.core.service imports THIS module, so a module-level
+    import would be circular.
+    """
+    try:
+        from antra.core.service import _resolve_mirror_api_key
+        key = (_resolve_mirror_api_key(cfg) or "").strip()
+        if key:
+            return key
+    except Exception:  # pragma: no cover - never fail a fetch over key lookup
+        pass
+    # Same priority without the import, so a refactor upstream cannot strand us.
+    import os as _os
+    key = (_os.environ.get("ANTRA_MIRROR_API_KEY") or "").strip()
+    if not key:
+        try:
+            from antra.core.endpoint_manifest import load_endpoint_manifest
+            key = (getattr(load_endpoint_manifest(), "api_key", "") or "").strip()
+        except Exception:
+            key = ""
+    if not key:
+        key = (getattr(cfg, "antra_api_key", "") or "").strip()
+    return key
+
+
+logger = logging.getLogger(__name__)
+
+_DEEZER_API = "https://api.deezer.com"
+_ODESLI_API = "https://api.song.link/v1-alpha.1/links"
+
+
+def is_tidal_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("tidal.com") or host.endswith("listen.tidal.com")
+
+
+def is_qobuz_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("qobuz.com") or host == "open.qobuz.com"
+
+
+def is_deezer_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host.endswith("deezer.com") or host in {"deezer.page.link", "link.deezer.com"}
+
+
+class ExternalMusicFetcher:
+    """Resolve TIDAL, Qobuz, and Deezer URLs to normalized track metadata."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/html, */*",
+            }
+        )
+
+    def fetch(self, url: str) -> list[TrackMetadata]:
+        if is_deezer_url(url):
+            return self._fetch_deezer(url)
+        if is_qobuz_url(url):
+            return self._fetch_qobuz(url)
+        if is_tidal_url(url):
+            return self._fetch_tidal(url)
+        raise ValueError(f"Unsupported external music URL: {url}")
+
+    @staticmethod
+    def _stamp_request_kind(tracks: list[TrackMetadata], kind: str) -> None:
+        for track in tracks:
+            track.request_kind = kind
+
+    # -- Deezer -------------------------------------------------------------
+
+    def _fetch_deezer(self, url: str) -> list[TrackMetadata]:
+        kind, item_id = self._extract_deezer_kind_id(url)
+        if kind == "track":
+            data = self._deezer_get(f"track/{item_id}")
+            tracks = [self._deezer_track(data)]
+            self._stamp_request_kind(tracks, "track")
+            return tracks
+        if kind == "album":
+            data = self._deezer_get(f"album/{item_id}")
+            album_title = data.get("title") or ""
+            album_artist = (data.get("artist") or {}).get("name") or ""
+            artwork = self._best_deezer_cover(data)
+            tracks = ((data.get("tracks") or {}).get("data") or [])
+            total_tracks = int(data.get("nb_tracks") or len(tracks) or 0) or None
+            tracks = [
+                self._deezer_track(
+                    item,
+                    album_title=album_title,
+                    album_artist=album_artist,
+                    artwork_url=artwork,
+                    release_date=data.get("release_date") or None,
+                    total_tracks=total_tracks,
+                    position=index,
+                )
+                for index, item in enumerate(tracks, 1)
+            ]
+            self._stamp_request_kind(tracks, "album")
+            return tracks
+        if kind == "playlist":
+            data = self._deezer_get(f"playlist/{item_id}")
+            playlist_name = data.get("title") or ""
+            playlist_owner = (data.get("creator") or {}).get("name") or ""
+            playlist_description = data.get("description") or ""
+            playlist_artwork = self._best_deezer_cover(data)
+            tracks = ((data.get("tracks") or {}).get("data") or [])
+            tracks = [
+                self._deezer_track(
+                    item,
+                    playlist_name=playlist_name,
+                    playlist_owner=playlist_owner,
+                    playlist_description=playlist_description,
+                    playlist_artwork_url=playlist_artwork,
+                    position=index,
+                )
+                for index, item in enumerate(tracks, 1)
+            ]
+            self._stamp_request_kind(tracks, "playlist")
+            return tracks
+        raise ValueError(f"Unsupported Deezer URL type: {kind}")
+
+    def _deezer_get(self, path: str) -> dict[str, Any]:
+        resp = self._session.get(f"{_DEEZER_API}/{path}", timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"Deezer API error: {data['error']}")
+        return data
+
+    def _extract_deezer_kind_id(self, url: str) -> tuple[str, str]:
+        resolved = self._resolve_redirect(url)
+        patterns = (
+            r"deezer\.com/(?:[a-z]{2}/)?(?P<kind>album|playlist|track)/(?P<id>\d+)",
+            r"deezer\.page\.link/.*?(?P<kind>album|playlist|track)/(?P<id>\d+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, resolved, re.IGNORECASE)
+            if match:
+                return match.group("kind").lower(), match.group("id")
+        if "deezer.com/soon" in resolved:
+            fallback = self._resolve_deezer_shortlink_via_songlink(url)
+            if fallback:
+                return fallback
+        raise ValueError(
+            "Unsupported Deezer URL. Expected deezer.com/album/..., /playlist/..., or /track/..."
+        )
+
+    def _resolve_deezer_shortlink_via_songlink(self, url: str) -> Optional[tuple[str, str]]:
+        params = {"url": url}
+        api_key = getattr(self.cfg, "odesli_api_key", "") or ""
+        if api_key:
+            params["key"] = api_key
+        try:
+            resp = self._session.get(_ODESLI_API, params=params, timeout=15)
+            if not resp.ok:
+                logger.debug(
+                    "[ExternalMusic] song.link Deezer short-link lookup failed: HTTP %s",
+                    resp.status_code,
+                )
+                return None
+            data = resp.json()
+        except Exception as exc:
+            logger.debug(f"[ExternalMusic] song.link Deezer short-link lookup failed: {exc}")
+            return None
+
+        entity_uid = str(data.get("entityUniqueId") or "")
+        if not entity_uid.startswith("DEEZER_"):
+            return None
+
+        entity = (data.get("entitiesByUniqueId") or {}).get(entity_uid) or {}
+        raw_id = str(entity.get("id") or "")
+        if not raw_id:
+            return None
+
+        if entity_uid.startswith("DEEZER_SONG::"):
+            return ("track", raw_id)
+        if entity_uid.startswith("DEEZER_ALBUM::"):
+            return ("album", raw_id)
+        if entity_uid.startswith("DEEZER_PLAYLIST::"):
+            return ("playlist", raw_id)
+        return None
+
+    def _deezer_track(
+        self,
+        item: dict[str, Any],
+        *,
+        album_title: str = "",
+        album_artist: str = "",
+        artwork_url: Optional[str] = None,
+        release_date: Optional[str] = None,
+        total_tracks: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        playlist_owner: Optional[str] = None,
+        playlist_description: Optional[str] = None,
+        playlist_artwork_url: Optional[str] = None,
+        position: Optional[int] = None,
+    ) -> TrackMetadata:
+        artist = (item.get("artist") or {}).get("name") or ""
+        album = item.get("album") or {}
+        return TrackMetadata(
+            title=item.get("title") or item.get("title_short") or "",
+            artists=[artist] if artist else [],
+            album=album_title or album.get("title") or "",
+            album_artists=[album_artist] if album_artist else [],
+            artwork_url=artwork_url or self._best_deezer_cover(album),
+            playlist_name=playlist_name,
+            playlist_owner=playlist_owner,
+            playlist_description=playlist_description,
+            playlist_position=position if playlist_name else None,
+            playlist_artwork_url=playlist_artwork_url,
+            release_date=release_date,
+            release_year=int(release_date[:4]) if release_date and release_date[:4].isdigit() else None,
+            track_number=item.get("track_position") or (position if album_title else None),
+            disc_number=item.get("disk_number") or None,
+            total_tracks=total_tracks,
+            duration_ms=(int(item["duration"]) * 1000) if item.get("duration") else None,
+            isrc=item.get("isrc") or None,
+            deezer_track_id=str(item.get("id")) if item.get("id") else None,
+            album_id=str(album.get("id")) if album.get("id") else None,
+            spotify_url=None,
+            is_explicit=bool(item.get("explicit_lyrics")) if "explicit_lyrics" in item else None,
+        )
+
+    @staticmethod
+    def _best_deezer_cover(data: dict[str, Any]) -> Optional[str]:
+        return (
+            data.get("cover_xl")
+            or data.get("picture_xl")
+            or data.get("cover_big")
+            or data.get("picture_big")
+            or data.get("cover_medium")
+            or data.get("picture_medium")
+        )
+
+    # -- Qobuz --------------------------------------------------------------
+
+    def _fetch_qobuz(self, url: str) -> list[TrackMetadata]:
+        kind, item_id = self._extract_qobuz_kind_id(url)
+
+        # Try local Qobuz credentials first
+        try:
+            adapter = self._qobuz_adapter()
+            if kind == "track":
+                data = adapter._api_get("track/get", params={"track_id": item_id}).json()
+                tracks = [self._qobuz_track(data)]
+                self._stamp_request_kind(tracks, "track")
+                return tracks
+            if kind == "album":
+                data = adapter._api_get("album/get", params={"album_id": item_id}).json()
+                album_title = data.get("title") or ""
+                album_artist = ((data.get("artist") or {}).get("name") or "")
+                artwork = self._qobuz_image(data.get("image") or {})
+                tracks = ((data.get("tracks") or {}).get("items") or [])
+                tracks = [
+                    self._qobuz_track(
+                        item,
+                        album_title=album_title,
+                        album_artist=album_artist,
+                        artwork_url=artwork,
+                        release_date=data.get("release_date_original") or data.get("release_date_download"),
+                        total_tracks=data.get("tracks_count") or len(tracks),
+                    )
+                    for item in tracks
+                ]
+                self._stamp_request_kind(tracks, "album")
+                return tracks
+            if kind == "playlist":
+                data = adapter._api_get("playlist/get", params={"playlist_id": item_id}).json()
+                playlist_name = data.get("name") or data.get("title") or ""
+                owner = ((data.get("owner") or {}).get("name") or "")
+                artwork = self._qobuz_image(data.get("image_rectangle") or data.get("image") or {})
+                tracks = ((data.get("tracks") or {}).get("items") or [])
+                tracks = [
+                    self._qobuz_track(
+                        item,
+                        playlist_name=playlist_name,
+                        playlist_owner=owner,
+                        playlist_description=data.get("description") or "",
+                        playlist_artwork_url=artwork,
+                        playlist_position=index,
+                    )
+                    for index, item in enumerate(tracks, 1)
+                ]
+                self._stamp_request_kind(tracks, "playlist")
+                return tracks
+        except Exception as e:
+            err_str = str(e).lower()
+            if not any(kw in err_str for kw in (
+                "requires qobuz credentials", "not configured", "is_available",
+                "empty", "auth", "token", "401", "403", "login",
+            )):
+                raise
+            logger.debug("[ExternalMusic] Qobuz local credentials unavailable (%s) — trying VPS mirror", e)
+
+        return self._fetch_qobuz_via_mirror(kind, item_id)
+
+    # Must stay ABOVE the mirror's own rotation budget (QOBUZ_ROTATION_BUDGET_S,
+    # 25s). Qobuz album ids are region-scoped, so the mirror walks its account
+    # pool until a region that holds the id answers — measured worst case 28s.
+    # At the previous 20s this client aborted first and surfaced a bare
+    # "Read timed out" instead of the mirror's own explanatory error.
+    _QOBUZ_MIRROR_TIMEOUT = 45
+
+    def _fetch_qobuz_via_mirror(self, kind: str, item_id: str) -> list[TrackMetadata]:
+        """Fetch Qobuz metadata via the VPS mirror — no local credentials required."""
+        from antra.core.endpoint_manifest import load_endpoint_manifest
+
+        manifest = load_endpoint_manifest()
+        # cfg first: QOBUZ_MIRROR_URL is exported by the Go layer alongside
+        # ANTRA_ENDPOINT_MANIFEST_DISABLED. Reading only the manifest meant that on
+        # a machine with no cache the URL came back empty and this raised "No Qobuz
+        # mirror URL available" even though Go had just supplied it.
+        mirror_url = ((getattr(self.cfg, "qobuz_mirror_url", "") or "").strip()
+                      or (getattr(manifest, "mirror_qobuz", "") or "")).rstrip("/")
+        api_key = _mirror_key(self.cfg)
+
+        if not mirror_url:
+            raise RuntimeError(
+                "No Qobuz mirror URL available. "
+                "Add Qobuz credentials in Settings, or ensure the endpoint manifest is reachable."
+            )
+
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        try:
+            if kind == "album":
+                r = self._session.get(
+                    f"{mirror_url}/api/album/{item_id}",
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(f"Album {item_id} not found on Qobuz")
+                r.raise_for_status()
+                data = r.json()
+            elif kind == "track":
+                r = self._session.get(
+                    f"{mirror_url}/api/meta/track/{item_id}",
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(f"Track {item_id} not found on Qobuz")
+                r.raise_for_status()
+                tracks = [self._qobuz_track(r.json())]
+                self._stamp_request_kind(tracks, "track")
+                return tracks
+            elif kind == "playlist":
+                r = self._session.get(
+                    f"{mirror_url}/api/playlist/{item_id}",
+                    headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(f"Playlist {item_id} not found on Qobuz")
+                r.raise_for_status()
+                data = r.json()
+                playlist_name = data.get("title", "")
+                playlist_owner = data.get("owner") or ""
+                playlist_description = data.get("description", "") or ""
+                playlist_artwork_url = data.get("artwork_url")
+                tracks = data.get("tracks") or []
+                tracks = [
+                    self._qobuz_track(
+                        item,
+                        playlist_name=playlist_name,
+                        playlist_owner=playlist_owner,
+                        playlist_description=playlist_description,
+                        playlist_artwork_url=playlist_artwork_url,
+                        playlist_position=index,
+                    )
+                    for index, item in enumerate(tracks, 1)
+                ]
+                self._stamp_request_kind(tracks, "playlist")
+                return tracks
+            else:
+                raise ValueError(f"Unsupported Qobuz URL type: {kind}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not fetch Qobuz metadata via mirror for {kind}/{item_id}: {e}. "
+                "Qobuz ids are region-scoped, so an id copied from one storefront's "
+                "URL may not exist in another region's catalog — try the same release "
+                "from a different Qobuz storefront, or use a Spotify/Apple link instead."
+            ) from e
+
+        album_title = data.get("title", "")
+        album_artists = data.get("album_artists") or []
+        album_artist = album_artists[0] if album_artists else ""
+        artwork_url = data.get("artwork_url")
+        release_date = data.get("release_date") or ""
+        release_year = data.get("release_year") or (
+            int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
+        )
+        total_tracks = data.get("total_tracks") or len(data.get("tracks", []))
+
+        result = []
+        for t in data.get("tracks") or []:
+            rd = release_date
+            ry = release_year
+            result.append(TrackMetadata(
+                title=t.get("title") or "",
+                artists=t.get("artists") or [],
+                album=album_title,
+                album_artists=album_artists,
+                artwork_url=artwork_url,
+                release_date=rd or None,
+                release_year=ry,
+                track_number=t.get("track_number"),
+                disc_number=t.get("disc_number"),
+                total_tracks=total_tracks,
+                duration_ms=t.get("duration_ms") or None,
+                isrc=t.get("isrc") or None,
+                album_id=t.get("album_id") or item_id,
+                is_explicit=t.get("explicit"),
+            ))
+        self._stamp_request_kind(result, "album")
+        return result
+
+    def _qobuz_adapter(self):
+        from antra.sources.qobuz import QobuzAdapter
+
+        adapter = QobuzAdapter(
+            email=getattr(self.cfg, "qobuz_email", ""),
+            password=getattr(self.cfg, "qobuz_password", ""),
+            app_id=getattr(self.cfg, "qobuz_app_id", ""),
+            app_secret=getattr(self.cfg, "qobuz_app_secret", ""),
+            user_auth_token=getattr(self.cfg, "qobuz_user_auth_token", ""),
+        )
+        if not adapter.is_available():
+            raise RuntimeError(
+                "Qobuz link fetching requires Qobuz credentials or a user auth token in Settings."
+            )
+        return adapter
+
+    @staticmethod
+    def _extract_qobuz_kind_id(url: str) -> tuple[str, str]:
+        match = re.search(r"(?:open|play)\.qobuz\.com/(?P<kind>album|playlist|track)/(?P<id>[\w-]+)", url, re.IGNORECASE)
+        if match:
+            return match.group("kind").lower(), match.group("id")
+        match = re.search(r"qobuz\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?P<kind>album|playlist|track)/.+/(?P<id>[\w-]+)(?:[/?#]|$)", url, re.IGNORECASE)
+        if match:
+            return match.group("kind").lower(), match.group("id")
+        match = re.search(r"qobuz\.com/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?P<kind>album|playlist|track)/(?P<id>[\w-]+)(?:[/?#]|$)", url, re.IGNORECASE)
+        if match:
+            return match.group("kind").lower(), match.group("id")
+        raise ValueError(
+            "Unsupported Qobuz URL. Expected play.qobuz.com/album/..., open.qobuz.com/..., or qobuz.com/.../album|playlist|track/..."
+        )
+
+    def _qobuz_track(
+        self,
+        item: dict[str, Any],
+        *,
+        album_title: str = "",
+        album_artist: str = "",
+        artwork_url: Optional[str] = None,
+        release_date: Optional[str] = None,
+        total_tracks: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        playlist_owner: Optional[str] = None,
+        playlist_description: Optional[str] = None,
+        playlist_artwork_url: Optional[str] = None,
+        playlist_position: Optional[int] = None,
+    ) -> TrackMetadata:
+        performer = item.get("performer") or {}
+        raw_album = item.get("album")
+        album = raw_album if isinstance(raw_album, dict) else {}
+        artist_list = item.get("artists") or []
+        artist_name = (
+            performer.get("name")
+            or ((item.get("artist") or {}).get("name") or "")
+            or (artist_list[0] if artist_list else "")
+        )
+        album_title_value = album_title or (raw_album if isinstance(raw_album, str) else album.get("title") or "")
+        album_artists_value = (
+            [album_artist] if album_artist else (item.get("album_artists") or [])
+        )
+        return TrackMetadata(
+            title=item.get("title") or "",
+            artists=[artist_name] if artist_name else [],
+            album=album_title_value,
+            album_artists=album_artists_value,
+            artwork_url=artwork_url or self._qobuz_image(album.get("image") or item.get("image") or {}),
+            playlist_name=playlist_name,
+            playlist_owner=playlist_owner,
+            playlist_description=playlist_description,
+            playlist_position=playlist_position,
+            playlist_artwork_url=playlist_artwork_url,
+            release_date=release_date or item.get("release_date_original") or item.get("release_date_download"),
+            release_year=int(_rd[:4]) if (_rd := (release_date or item.get("release_date_original") or item.get("release_date_download") or "")) and _rd[:4].isdigit() else None,
+            track_number=item.get("track_number") or item.get("media_number"),
+            disc_number=item.get("media_number") or None,
+            total_tracks=total_tracks,
+            duration_ms=(int(item["duration"]) * 1000) if item.get("duration") else None,
+            isrc=item.get("isrc") or None,
+            album_id=str(album.get("id")) if album.get("id") else None,
+            upc=album.get("upc") or None,
+            is_explicit=item.get("parental_warning") if isinstance(item.get("parental_warning"), bool) else None,
+        )
+
+    @staticmethod
+    def _qobuz_image(image: dict[str, Any]) -> Optional[str]:
+        return image.get("large") or image.get("extralarge") or image.get("small") or image.get("thumbnail")
+
+    # -- TIDAL --------------------------------------------------------------
+
+    def _fetch_tidal(self, url: str) -> list[TrackMetadata]:
+        kind, item_id = self._extract_tidal_kind_id(url)
+
+        # Try local Tidal session first (if configured in Settings)
+        try:
+            session = self._tidal_session()
+            if kind == "track":
+                tracks = [self._tidal_track(session.track(int(item_id)))]
+                self._stamp_request_kind(tracks, "track")
+                return tracks
+            if kind == "album":
+                album = session.album(int(item_id))
+                tracks = album.tracks()
+                result = [
+                    self._tidal_track(
+                        track,
+                        album_title=getattr(album, "name", "") or "",
+                        album_artist=self._tidal_artist_name(album),
+                        artwork_url=self._tidal_image(album),
+                        release_date=str(getattr(album, "release_date", "") or "") or None,
+                        total_tracks=len(tracks),
+                    )
+                    for track in tracks
+                ]
+                self._stamp_request_kind(result, "album")
+                return result
+            if kind == "playlist":
+                playlist = session.playlist(item_id)
+                tracks = playlist.tracks()
+                result = [
+                    self._tidal_track(
+                        track,
+                        playlist_name=getattr(playlist, "name", "") or "",
+                        playlist_description=getattr(playlist, "description", "") or "",
+                        playlist_artwork_url=self._tidal_image(playlist),
+                        playlist_position=index,
+                    )
+                    for index, track in enumerate(tracks, 1)
+                ]
+                self._stamp_request_kind(result, "playlist")
+                return result
+        except Exception as e:
+            err_str = str(e).lower()
+            # Re-raise only hard network/connectivity failures — everything else
+            # (auth errors, not-found, geo-restriction, token expiry, etc.) falls
+            # through to the VPS mirror which uses different country-code sessions
+            # and may be able to access the content where the local session can't.
+            is_network_error = any(kw in err_str for kw in (
+                "connection", "timeout", "network", "refused", "unreachable",
+                "name resolution", "ssl", "certificate",
+            ))
+            if is_network_error:
+                raise
+            logger.debug("[ExternalMusic] Tidal local session failed (%s) — trying VPS mirror", e)
+
+        # Fallback: public Tidal API via VPS mirror (different country sessions)
+        return self._fetch_tidal_public(kind, item_id)
+
+    def _fetch_tidal_public(self, kind: str, item_id: str) -> list[TrackMetadata]:
+        """Fetch Tidal metadata via the VPS mirror server — no local session required."""
+        from antra.core.endpoint_manifest import load_endpoint_manifest
+
+        manifest = load_endpoint_manifest()
+        # cfg first — see the note in _fetch_qobuz_via_mirror: TIDAL_MIRROR_URL is
+        # exported by the Go layer and was being ignored here.
+        mirror_url = ((getattr(self.cfg, "tidal_mirror_url", "") or "").strip()
+                      or (getattr(manifest, "mirror_tidal", "") or "")).rstrip("/")
+        api_key = _mirror_key(self.cfg)
+
+        if not mirror_url:
+            raise RuntimeError(
+                "No Tidal mirror URL available. "
+                "Connect a Tidal account in Settings, or ensure the endpoint manifest is reachable."
+            )
+
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        try:
+            if kind == "album":
+                r = self._session.get(
+                    f"{mirror_url}/api/album/{item_id}",
+                    headers=headers, timeout=60,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(
+                        f"Album {item_id} not found on Tidal — "
+                        "it may be geo-restricted or removed from the TIDAL catalogue"
+                    )
+                if r.status_code == 429:
+                    raise RuntimeError(
+                        f"Daily album metadata limit reached for album {item_id} — "
+                        "please try again tomorrow (limit resets at UTC midnight)"
+                    )
+                r.raise_for_status()
+                data = r.json()
+
+                album_title = data.get("title", "")
+                album_artists = data.get("album_artists") or []
+                album_artist = album_artists[0] if album_artists else ""
+                artwork_url = data.get("artwork_url")
+                release_date = data.get("release_date") or ""
+                release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
+                total_tracks = data.get("total_tracks") or len(data.get("tracks", []))
+
+                result = []
+                for t in data.get("tracks") or []:
+                    rd = release_date
+                    ry = release_year
+                    # artists may be a list of strings or list of dicts
+                    raw_artists = t.get("artists") or []
+                    track_artists = [
+                        (a if isinstance(a, str) else a.get("name", ""))
+                        for a in raw_artists if a
+                    ]
+                    raw_tid = t.get("track_id") or t.get("id")
+                    tidal_tid = str(raw_tid) if raw_tid else None
+                    result.append(TrackMetadata(
+                        title=t.get("title") or "",
+                        artists=track_artists,
+                        album=album_title,
+                        album_artists=album_artists,
+                        artwork_url=artwork_url,
+                        release_date=rd or None,
+                        release_year=ry,
+                        track_number=t.get("track_number"),
+                        disc_number=t.get("disc_number"),
+                        total_tracks=total_tracks,
+                        duration_ms=t.get("duration_ms") or None,
+                        isrc=t.get("isrc") or None,
+                        album_id=t.get("album_id") or str(item_id),
+                        is_explicit=t.get("explicit"),
+                        tidal_track_id=tidal_tid,
+                        source_service="tidal",
+                    ))
+                self._stamp_request_kind(result, "album")
+                return result
+
+            if kind == "track":
+                r = self._session.get(
+                    f"{mirror_url}/api/meta/track/{item_id}",
+                    headers=headers, timeout=60,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(f"Track {item_id} not found on Tidal")
+                r.raise_for_status()
+                data = r.json()
+                if not isinstance(data, dict):
+                    raise RuntimeError(
+                        f"Unexpected response from mirror for track {item_id}: {str(data)[:200]}"
+                    )
+                if data.get("error") or data.get("status") == "error":
+                    raise RuntimeError(
+                        f"Mirror error for track {item_id}: {data.get('error') or data.get('message', 'unknown')}"
+                    )
+                tracks = [self._tidal_track_from_public(data, artwork_url=data.get("artwork_url"), release_date=data.get("releaseDate"))]
+                self._stamp_request_kind(tracks, "track")
+                return tracks
+
+            if kind == "playlist":
+                r = self._session.get(
+                    f"{mirror_url}/api/playlist/{item_id}",
+                    headers=headers, timeout=60,
+                )
+                if r.status_code == 404:
+                    raise RuntimeError(f"Playlist {item_id} not found on Tidal")
+                r.raise_for_status()
+                data = r.json()
+                playlist_name = data.get("title", "")
+                playlist_description = data.get("description", "") or ""
+                playlist_artwork_url = data.get("artwork_url")
+                tracks = data.get("tracks") or []
+                tracks = [
+                    self._tidal_track_from_public(
+                        item,
+                        playlist_name=playlist_name,
+                        playlist_description=playlist_description,
+                        playlist_artwork_url=playlist_artwork_url,
+                        playlist_position=index,
+                    )
+                    for index, item in enumerate(tracks, 1)
+                ]
+                self._stamp_request_kind(tracks, "playlist")
+                return tracks
+
+        except RuntimeError as mirror_err:
+            # Mirror returned 404 — try scraping Tidal's web page directly
+            if kind not in ("album", "track"):
+                raise
+            logger.info(
+                "[Tidal] Mirror failed for %s %s — falling back to web page scrape",
+                kind, item_id,
+            )
+            try:
+                if kind == "album":
+                    return self._scrape_tidal_album_page(item_id)
+                return self._scrape_tidal_track_page(item_id)
+            except Exception as scrape_err:
+                logger.debug("[Tidal] Web page scrape also failed: %s", scrape_err)
+                raise mirror_err from scrape_err
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not fetch Tidal metadata via mirror for {kind}/{item_id}. "
+                f"Connect a Tidal account in Settings for reliable access. Error: {e}"
+            ) from e
+
+        raise ValueError(f"Unsupported TIDAL URL type: {kind}")
+
+    def _scrape_tidal_album_page(self, item_id: str) -> list[TrackMetadata]:
+        """Scrape Tidal's album web page for JSON-LD metadata as a fallback."""
+        from antra.core.amazon_music_fetcher import _parse_iso_duration
+
+        url = f"https://tidal.com/browse/album/{item_id}"
+        logger.info("[Tidal] Scraping album page: %s", url)
+        resp = self._session.get(url, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Album {item_id} not found on Tidal (web page returned {resp.status_code})")
+        html = resp.text
+
+        # Find JSON-LD blocks
+        jsonld_blocks = re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        album_data = None
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict) and data.get("@type") in ("MusicAlbum", "Album"):
+                    album_data = data
+                    break
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") in ("MusicAlbum", "Album"):
+                            album_data = item
+                            break
+            except Exception:
+                continue
+
+        if album_data is None:
+            raise RuntimeError(
+                f"Album {item_id} not found on Tidal — no JSON-LD metadata in page"
+            )
+
+        album_name = album_data.get("name", "")
+        album_artist_data = album_data.get("byArtist") or {}
+        album_artist = album_artist_data.get("name", "") if isinstance(album_artist_data, dict) else (
+            album_artist_data[0].get("name", "") if isinstance(album_artist_data, list) and album_artist_data
+            else str(album_artist_data) if album_artist_data else ""
+        )
+        album_artists = [album_artist] if album_artist else []
+
+        release_date = (album_data.get("datePublished") or "")[:10]
+        release_year = int(release_date[:4]) if release_date[:4].isdigit() else None
+
+        # Artwork from image field or Open Graph
+        artwork_url = None
+        image = album_data.get("image")
+        if isinstance(image, str) and image.startswith("http"):
+            artwork_url = image
+        elif isinstance(image, list):
+            for img in image:
+                if isinstance(img, str) and img.startswith("http"):
+                    artwork_url = img
+                    break
+                if isinstance(img, dict) and img.get("url", "").startswith("http"):
+                    artwork_url = img["url"]
+                    break
+        if not artwork_url:
+            og_img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+            if og_img:
+                artwork_url = og_img.group(1)
+
+        raw_tracks = album_data.get("track") or []
+        if not raw_tracks:
+            raise RuntimeError(
+                f"Album {item_id!r} has no tracks in JSON-LD — cannot proceed"
+            )
+
+        result = []
+        for item in raw_tracks:
+            if isinstance(item, dict) and item.get("@type") != "MusicRecording":
+                continue
+            if isinstance(item, dict) and not item.get("name"):
+                continue
+            title = item.get("name", "").strip() if isinstance(item, dict) else ""
+            if not title:
+                continue
+
+            track_artist_data = item.get("byArtist") if isinstance(item, dict) else None
+            track_artist = ""
+            if isinstance(track_artist_data, dict):
+                track_artist = track_artist_data.get("name", "")
+            elif isinstance(track_artist_data, list) and track_artist_data:
+                track_artist = track_artist_data[0].get("name", "") if isinstance(track_artist_data[0], dict) else ""
+
+            duration_iso = item.get("duration", "") if isinstance(item, dict) else ""
+            duration_ms = _parse_iso_duration(duration_iso)
+
+            position = item.get("position") if isinstance(item, dict) else None
+            track_num = int(position) if position and str(position).isdigit() else None
+
+            # Extract Tidal track ID from the JSON-LD url field (e.g. "https://tidal.com/track/12345678")
+            tidal_tid = None
+            track_url = item.get("url", "") if isinstance(item, dict) else ""
+            if track_url:
+                m = re.search(r"/track/(\d+)", track_url)
+                if m:
+                    tidal_tid = m.group(1)
+
+            result.append(TrackMetadata(
+                title=title,
+                artists=([track_artist] if track_artist else album_artists[:1]) or [],
+                album=album_name,
+                album_artists=album_artists,
+                artwork_url=artwork_url,
+                release_date=release_date or None,
+                release_year=release_year,
+                track_number=track_num,
+                total_tracks=len(raw_tracks),
+                duration_ms=duration_ms,
+                album_id=str(item_id),
+                tidal_track_id=tidal_tid,
+                source_service="tidal" if tidal_tid else None,
+            ))
+
+        if not result:
+            raise RuntimeError(
+                f"Album {item_id} — no valid tracks found in JSON-LD data"
+            )
+
+        self._stamp_request_kind(result, "album")
+        logger.info("[Tidal] Web scrape: parsed %d tracks for album %r", len(result), album_name)
+        return result
+
+    def _scrape_tidal_track_page(self, item_id: str) -> list[TrackMetadata]:
+        """Scrape Tidal's track web page for JSON-LD metadata as a fallback."""
+        from antra.core.amazon_music_fetcher import _parse_iso_duration
+
+        url = f"https://tidal.com/browse/track/{item_id}"
+        resp = self._session.get(url, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Track {item_id} not found on Tidal (web page returned {resp.status_code})")
+        html = resp.text
+
+        jsonld_blocks = re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        track_data = None
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict) and data.get("@type") == "MusicRecording":
+                    track_data = data
+                    break
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") == "MusicRecording":
+                            track_data = item
+                            break
+            except Exception:
+                continue
+
+        if not track_data:
+            raise RuntimeError(f"Track {item_id} not found on Tidal — no JSON-LD metadata in page")
+
+        track = TrackMetadata(
+            title=track_data.get("name", ""),
+            artists=self._tidal_scrape_artists(track_data),
+            album=(track_data.get("inAlbum") or {}).get("name", "") or "",
+            artwork_url=self._tidal_scrape_image(track_data),
+            duration_ms=_parse_iso_duration(track_data.get("duration", "")),
+            album_id=str(item_id),
+        )
+        self._stamp_request_kind([track], "track")
+        return [track]
+
+    @staticmethod
+    def _tidal_scrape_artists(data: dict) -> list[str]:
+        by_artist = data.get("byArtist") or []
+        if isinstance(by_artist, dict):
+            return [by_artist.get("name", "")]
+        if isinstance(by_artist, list):
+            return [a.get("name", "") for a in by_artist if isinstance(a, dict) and a.get("name")]
+        return []
+
+    @staticmethod
+    def _tidal_scrape_image(data: dict) -> Optional[str]:
+        image = data.get("image")
+        if isinstance(image, str) and image.startswith("http"):
+            return image
+        if isinstance(image, list):
+            for img in image:
+                if isinstance(img, str) and img.startswith("http"):
+                    return img
+                if isinstance(img, dict):
+                    url = img.get("url", "")
+                    if url.startswith("http"):
+                        return url
+        return None
+
+    def _tidal_track_from_public(
+        self,
+        data: dict,
+        *,
+        album_title: str = "",
+        album_artist: str = "",
+        artwork_url: Optional[str] = None,
+        release_date: Optional[str] = None,
+        total_tracks: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        playlist_description: Optional[str] = None,
+        playlist_artwork_url: Optional[str] = None,
+        playlist_position: Optional[int] = None,
+    ) -> TrackMetadata:
+        """Convert a public Tidal API track object to TrackMetadata."""
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected dict from Tidal API, got {type(data).__name__}: {str(data)[:200]}")
+        album_raw = data.get("album") or {}
+        album = album_raw if isinstance(album_raw, dict) else {}
+        artists_raw = data.get("artists") or []
+        artists = []
+        for a in artists_raw:
+            if isinstance(a, dict):
+                name = a.get("name", "")
+            elif isinstance(a, str):
+                name = a
+            else:
+                name = ""
+            if name:
+                artists.append(name)
+        if not artists:
+            artist_raw = data.get("artist") or {}
+            if isinstance(artist_raw, dict):
+                name = artist_raw.get("name", "")
+            elif isinstance(artist_raw, str):
+                name = artist_raw
+            else:
+                name = ""
+            if name:
+                artists = [name]
+
+        rd = release_date or album.get("releaseDate") or ""
+        release_year = int(rd[:4]) if rd and rd[:4].isdigit() else None
+
+        # Cover art: check data-level artwork_url first (returned by /api/meta/track/),
+        # then fall back to album.cover (returned by /api/album/ track list)
+        if not artwork_url:
+            artwork_url = data.get("artwork_url") or None
+        if not artwork_url:
+            cover = album.get("cover", "")
+            if cover:
+                artwork_url = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/1280x1280.jpg"
+
+        raw_id = data.get("id")
+        tidal_track_id = str(raw_id) if raw_id else None
+        return TrackMetadata(
+            title=data.get("title") or "",
+            artists=artists,
+            album=album_title or album.get("title") or "",
+            album_artists=[album_artist] if album_artist else [],
+            artwork_url=artwork_url,
+            playlist_name=playlist_name,
+            playlist_description=playlist_description,
+            playlist_artwork_url=playlist_artwork_url,
+            playlist_position=playlist_position,
+            release_date=rd or None,
+            release_year=release_year,
+            track_number=data.get("trackNumber"),
+            disc_number=data.get("volumeNumber"),
+            total_tracks=total_tracks,
+            duration_ms=(data.get("duration") or 0) * 1000 or None,
+            isrc=data.get("isrc") or None,
+            album_id=str(album.get("id")) if album.get("id") else None,
+            is_explicit=data.get("explicit"),
+            tidal_track_id=tidal_track_id,
+            source_service="tidal",
+        )
+
+    def _tidal_session(self):
+        from antra.sources.tidal import TidalAdapter
+
+        adapter = TidalAdapter(
+            email=getattr(self.cfg, "tidal_email", ""),
+            password=getattr(self.cfg, "tidal_password", ""),
+            enabled=True,
+            auth_mode=getattr(self.cfg, "tidal_auth_mode", "session_json"),
+            session_json=getattr(self.cfg, "tidal_session_json", ""),
+            access_token=getattr(self.cfg, "tidal_access_token", ""),
+            refresh_token=getattr(self.cfg, "tidal_refresh_token", ""),
+            session_id=getattr(self.cfg, "tidal_session_id", ""),
+            token_type=getattr(self.cfg, "tidal_token_type", "Bearer"),
+        )
+        return adapter._get_session()
+
+    @staticmethod
+    def _extract_tidal_kind_id(url: str) -> tuple[str, str]:
+        match = re.search(r"(?:listen\.)?tidal\.com/(?:browse/)?(?P<kind>album|playlist|track)/(?P<id>[\w-]+)", url, re.IGNORECASE)
+        if match:
+            return match.group("kind").lower(), match.group("id")
+        raise ValueError(
+            "Unsupported TIDAL URL. Expected tidal.com/browse/album/..., /playlist/..., or /track/..."
+        )
+
+    def _tidal_track(
+        self,
+        track: Any,
+        *,
+        album_title: str = "",
+        album_artist: str = "",
+        artwork_url: Optional[str] = None,
+        release_date: Optional[str] = None,
+        total_tracks: Optional[int] = None,
+        playlist_name: Optional[str] = None,
+        playlist_description: Optional[str] = None,
+        playlist_artwork_url: Optional[str] = None,
+        playlist_position: Optional[int] = None,
+    ) -> TrackMetadata:
+        album = getattr(track, "album", None)
+        return TrackMetadata(
+            title=getattr(track, "name", "") or "",
+            artists=self._tidal_artist_names(track),
+            album=album_title or getattr(album, "name", "") or "",
+            album_artists=[album_artist] if album_artist else [],
+            artwork_url=artwork_url or self._tidal_image(album),
+            playlist_name=playlist_name,
+            playlist_description=playlist_description,
+            playlist_position=playlist_position,
+            playlist_artwork_url=playlist_artwork_url,
+            release_date=release_date or str(getattr(track, "release_date", "") or "") or None,
+            release_year=int(_rd[:4]) if (_rd := (release_date or str(getattr(track, "release_date", "") or "") or "")) and _rd[:4].isdigit() else None,
+            track_number=getattr(track, "track_num", None) or getattr(track, "track_number", None),
+            disc_number=getattr(track, "volume_num", None) or getattr(track, "disc_number", None),
+            total_tracks=total_tracks,
+            duration_ms=(int(getattr(track, "duration", 0)) * 1000) if getattr(track, "duration", None) else None,
+            isrc=getattr(track, "isrc", None) or None,
+            album_id=str(getattr(album, "id", "")) if getattr(album, "id", None) else None,
+            is_explicit=getattr(track, "explicit", None),
+        )
+
+    @staticmethod
+    def _tidal_artist_names(item: Any) -> list[str]:
+        artists = getattr(item, "artists", None) or []
+        names = [getattr(artist, "name", "") for artist in artists]
+        if names:
+            return [name for name in names if name]
+        artist = getattr(item, "artist", None)
+        name = getattr(artist, "name", "") if artist else ""
+        return [name] if name else []
+
+    def _tidal_artist_name(self, item: Any) -> str:
+        names = self._tidal_artist_names(item)
+        return names[0] if names else ""
+
+    @staticmethod
+    def _tidal_image(item: Any) -> Optional[str]:
+        if item is None:
+            return None
+        for size in (1280, 640, 320):
+            try:
+                url = item.image(size)
+                if url:
+                    return url
+            except Exception:
+                continue
+        return None
+
+    # -- Shared -------------------------------------------------------------
+
+    def _resolve_redirect(self, url: str) -> str:
+        if not any(host in url for host in ("deezer.page.link", "link.deezer.com")):
+            return url
+        try:
+            resp = self._session.get(url, timeout=15, allow_redirects=True)
+            return resp.url or url
+        except Exception as exc:
+            logger.debug(f"[ExternalMusic] Could not resolve short Deezer URL: {exc}")
+            return url

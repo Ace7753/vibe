@@ -1,31 +1,23 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies + Node.js + Java
+# Install ALL runtimes: Python, Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    ca-certificates \
-    curl \
-    unzip \
-    libgcc-s1 \
-    libstdc++6 \
-    gnupg \
-    git \
-    build-essential \
+    ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
+    openjdk-17-jre-headless golang-go \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy the source files
+# Copy ALL project files including engines
 COPY requirements.txt .
 COPY app ./app
 COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install ALL Python-based Downloaders from local source
+# 1. Install Python Engines (SpotDL + Local Merges)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
@@ -36,17 +28,15 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install ./engines/savify && \
     pip install ./engines/onthespot
 
-# 2. Install Node.js Downloaders from local source
-RUN npm install -g ./engines/spotify-dl
+# 2. Install Node Engines (Spotify-DL + EzYTDL)
+RUN npm install -g ./engines/spotify-dl && \
+    npm install -g ./engines/ezytdl || true
 
-# 3. Install Deno (required for modern YouTube decryption)
+# 3. Install Deno (decryption master)
 RUN spotdl --download-deno
 
-# Create directories
+# Create folders
 RUN mkdir -p downloads archives
 
-# Expose port
 EXPOSE 8080
-
-# Run with python -u to ensure logs are flushed immediately
 CMD ["python", "-u", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,0 +1,38 @@
+{
+    "h264": {
+        "amf": {
+            "post": ["-profile:v", "high", "-quality", "quality"]
+        },
+        "nvenc": {
+            "post": ["-profile:v", "high", "-preset", "slow"]
+        },
+        "qsv": {
+            "post": ["-profile:v", "high", "-preset", "medium"]
+        },
+        "mf": {
+            "post": ["-quality:v", "0"]
+        }
+    },
+    "hevc": {
+        "amf": {
+            "post": ["-profile_tier:v", "high", "-quality", "quality", "-tier", "high"]
+        },
+        "nvenc": {
+            "post": ["-profile:v", "main10", "-preset", "slow"]
+        },
+        "qsv": {
+            "post": ["-profile:v", "main10", "-preset", "medium"]
+        },
+        "mf": {
+            "post": ["-quality:v", "0"]
+        }
+    },
+    "av1": {
+        "nvenc": {
+            "pre": ["-c:v", "av1"]
+        },
+        "mf": {
+            "post": ["-quality:v", "0"]
+        }
+    }
+}

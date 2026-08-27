@@ -89,6 +89,11 @@ async def run_god_engine(job_id: str, query: str, base_url: str):
     if len(after - before) == 0:
         await try_command(job, "Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)])
 
+    # 4. EzYTDL Fallback (Headless)
+    after = {f.name for f in DOWNLOAD_DIR.glob("*")}
+    if len(after - before) == 0:
+        await try_command(job, "EzYTDL", ["node", "/app/engines/ezytdl/index.js", "--headless", query])
+
     # FINAL CHECK
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     new_files = list(after - before)
