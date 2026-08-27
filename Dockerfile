@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 \
     libstdc++6 \
     gnupg \
-    openjdk-17-jre-headless \
     git \
     build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -19,34 +18,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements
+# Copy the source files
 COPY requirements.txt .
+COPY app ./app
+COPY vibe_icon_original.png .
+COPY vibe-config.json .
+COPY engines ./engines
 
-# 1. Install ALL requested Python engines
+# 1. Install ALL Python-based Downloaders from local source
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
     yt-dlp[default,curl-cffi] \
     ytmusicapi>=1.12.1 \
-    zspotify \
-    git+https://github.com/glomatico/votify.git \
-    git+https://github.com/LaurenceRawlings/savify.git \
-    git+https://github.com/ots-downloader/onthespot.git \
-    git+https://github.com/glomatico/spotify-web-downloader.git
+    zspotify && \
+    pip install ./engines/votify && \
+    pip install ./engines/savify && \
+    pip install ./engines/onthespot
 
-# 2. Install requested Node.js engines
-RUN npm install -g spotify-dl smd spotify-playlist-downloader
+# 2. Install Node.js Downloaders from local source
+RUN npm install -g ./engines/spotify-dl
 
 # 3. Install Deno (required for modern YouTube decryption)
 RUN spotdl --download-deno
 
 # Create directories
 RUN mkdir -p downloads archives
-
-# Copy app and assets
-COPY app ./app
-COPY vibe_icon_original.png .
-COPY vibe-config.json .
 
 # Expose port
 EXPOSE 8080

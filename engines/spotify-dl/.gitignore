@@ -1,0 +1,9 @@
+node_modules/
+./**/*.mp3
+.vscode/
+Makefile
+.DS_STORE
+*.mp3
+.spdlcache
+.spotifydl-*
+cookies.txt
