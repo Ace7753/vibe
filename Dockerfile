@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix Protobuf issue globally
+# Fix Protobuf and Path issues permanently
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ENV PYTHONPATH="/app/engines/merger:/app/engines/merger/src:/app/engines/merger/savify:/app/engines/merger/votify"
 
 WORKDIR /app
 
@@ -20,23 +21,25 @@ COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install Global Requirements (Conflict-Free + Consolidated)
+# 1. Install Global Requirements
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install "Arsenal" Engines by entering their specific folders
-# This ensures they are registered as global commands without PYTHONPATH hacks
-RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi || true
-RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi || true
-RUN if [ -d "engines/merger/antra" ]; then cd engines/merger/antra && pip install . ; fi || true
-
-# 3. Install Node Engines (Using the Merger root as the project)
+# 2. CREATE MASTER BINARY LINKS (Force engine names to work)
+# Node engines
 RUN cd engines/merger && npm install && \
     ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
-    chmod +x /app/engines/merger/cli.js || true
+    chmod +x /app/engines/merger/cli.js
 
-# 4. Decryption Master
+# Python engines (using module mode via wrapper scripts)
+RUN echo '#!/bin/bash\npython3 -m votify "$@"' > /usr/local/bin/votify && \
+    echo '#!/bin/bash\npython3 -m onthespot "$@"' > /usr/local/bin/onthespot && \
+    echo '#!/bin/bash\npython3 -m savify "$@"' > /usr/local/bin/savify && \
+    echo '#!/bin/bash\npython3 -m antra "$@"' > /usr/local/bin/antra && \
+    chmod +x /usr/local/bin/votify /usr/local/bin/onthespot /usr/local/bin/savify /usr/local/bin/antra
+
+# 3. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders

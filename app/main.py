@@ -32,7 +32,7 @@ app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
 # --- ENGINE CHAIN ---
 async def try_engine(job, label, cmd):
-    job["log"].append(f"🔍 [Chain] Attempting Engine: {label}...")
+    job["log"].append(f"🔍 [Arsenal] Swapping to {label}...")
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
 
@@ -63,25 +63,27 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
     job["status"] = "running"
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
-    # --- THE NUCLEAR 10-ENGINE CHAIN ---
+    # --- THE NUCLEAR 10-ENGINE CHAIN (V5 - STABILIZED) ---
     engines = [
         ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4", "--yt-dlp-args", "--impersonate chrome --no-check-certificate --extractor-args \"youtube:player_client=android,ios,web\""]),
         ("Spotify-DL", ["spotifydl", "--url", query, "--output", str(DOWNLOAD_DIR)]),
         ("Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)]),
-        ("OnTheSpot", ["onthespot-cli", query]),
+        ("OnTheSpot", ["onthespot", query]),
         ("Savify", ["savify", "download", query, "--path", str(DOWNLOAD_DIR)]),
         ("Antra", ["antra", query, "-o", str(DOWNLOAD_DIR)]),
         ("SpotiFLAC", ["go", "run", "/app/engines/merger/main.go", query]),
         ("EzYTDL", ["node", "/app/engines/merger/index.js", "--headless", query]),
-        ("Web-Downloader", ["spotify-web-downloader", query, "-o", str(DOWNLOAD_DIR)]),
-        ("Brute-Fallback", [sys.executable, "/app/engines/merger/spotify_to_mp3.py", query])
+        ("Web-Downloader", ["python3", "-m", "spotify_web_downloader", query, "-o", str(DOWNLOAD_DIR)]),
+        ("Brute-Fallback", ["python3", "/app/engines/merger/spotify_to_mp3.py", query])
     ]
 
     for label, cmd in engines:
+        # Check if files captured
         if len({f.name for f in DOWNLOAD_DIR.glob("*")} - before) > 0:
             job["log"].append(f"✅ Track snagged by {label}!")
             break
 
+        # Inject cookies into command if applicable
         if COOKIE_FILE.exists():
             if label in ["SpotDL", "Votify", "Web-Downloader"]:
                 cmd.extend(["--cookie-file" if label=="SpotDL" else "-c", str(COOKIE_FILE)])
@@ -96,14 +98,15 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
         with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
             for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
         job["zip_url"] = f"{base_url}/archives/{zip_name}"
+        job["log"].append("✅ Track secured! Proof of Arsenal.")
     else:
         job["status"] = "failed"
-        job["log"].append("❌ CRITICAL: ALL 10 ENGINES BLOCKED. Check your cookies.")
+        job["log"].append("❌ CRITICAL: ALL 10 ENGINES FAILED. The song is heavily protected.")
 
 @app.post("/api/download")
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Engine starting (Super-Chain)..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Arsenal warming up (10-Chain)..."], "zip_url": None}
     asyncio.create_task(run_vibe_engine(job_id, query, str(request.base_url).rstrip('/')))
     return {"job_id": job_id}
 
@@ -150,7 +153,6 @@ async def index():
 </head>
 <body class="min-h-screen pb-24">
     <div class="fixed inset-0 pointer-events-none z-0"><div class="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full opacity-20 blur-[120px]" style="background: {c['accent']};"></div></div>
-
     <nav class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 glass rounded-full px-6 py-3 flex gap-8 shadow-2xl">
         <button onclick="showPage('download')" id="nav-download" class="nav-active opacity-60"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
         <button onclick="showPage('files')" id="nav-files" class="opacity-60"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5.586a1 1 0 0 1 .707.293l5.414 5.414a1 1 0 0 1 .293.707V19a2 2 0 0 1-2 2z"/></svg></button>
