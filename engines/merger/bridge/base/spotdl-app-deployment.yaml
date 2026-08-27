@@ -1,0 +1,52 @@
+#! spotdl-app-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: spotdl-app
+    namespace: spotdl-app
+    labels:
+        com.docker.compose.project: spotdl-app
+        com.docker.compose.service: spotdl-app
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: spotdl-app
+            com.docker.compose.service: spotdl-app
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: spotdl-app
+                com.docker.compose.service: spotdl-app
+                com.docker.compose.network.default: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: spotdl-app
+                  image: spotdl-app:latest
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: DOWNLOAD_DIR
+                      value: "/downloads"
+                    - name: XDG_CACHE_HOME
+                      value: "/config/.cache"
+                    - name: XDG_CONFIG_HOME
+                      value: "/config"
+                  ports:
+                    - name: spotdl-app-8080
+                      containerPort: 8080
+                  volumeMounts:
+                    - name: downloads
+                      mountPath: /downloads
+                    - name: config
+                      mountPath: /config
+            volumes:
+                - name: downloads
+                  hostPath:
+                    path: C:\Users\ljack\Documents\Codex\2026-06-26\al\spotdl-app\downloads
+                - name: config
+                  hostPath:
+                    path: C:\Users\ljack\Documents\Codex\2026-06-26\al\spotdl-app\config

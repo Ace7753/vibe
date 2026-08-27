@@ -1,0 +1,11 @@
+# check if there is at least one published port
+
+#! spotdl-app-service.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: spotdl-app-published
+    namespace: spotdl-app
+spec:
+    type: LoadBalancer

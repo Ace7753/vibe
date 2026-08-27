@@ -1,0 +1,60 @@
+{
+  "name": "@swapnilsoni1999/spotify-dl",
+  "productName": "Spotify Downloader",
+  "version": "1.4.1",
+  "description": "Spotify Songs, Playlist & Album Downloader",
+  "main": "app.js",
+  "bin": {
+    "spotifydl": "cli.js"
+  },
+  "scripts": {
+    "test": "echo \"Type spotifydl for help.\"",
+    "start": "./cli.js",
+    "lint": "eslint .",
+    "lint-fix": "eslint . --fix"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SwapnilSoni1999/spotify-dl.git"
+  },
+  "keywords": [
+    "spotify-dl",
+    "spotifydl",
+    "spotify-downloader"
+  ],
+  "type": "module",
+  "author": "Swapnil Soni",
+  "license": "ISC",
+  "dependencies": {
+    "@distube/ytdl-core": "4.16.12",
+    "axios": "1.9.0",
+    "express": "4.21.2",
+    "fluent-ffmpeg": "2.1.3",
+    "genius-lyrics": "4.4.7",
+    "meow": "13.2.0",
+    "node-id3": "0.2.9",
+    "open": "10.1.2",
+    "ora": "8.2.0",
+    "puppeteer": "24.8.2",
+    "request": "2.88.2",
+    "sponsorblock-api": "0.2.4",
+    "spotified": "^1.1.5",
+    "string-similarity": "4.0.4",
+    "yt-search": "2.13.1"
+  },
+  "xo": {
+    "space": true,
+    "prettier": true,
+    "envs": [
+      "node"
+    ]
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com/@swapnilsoni1999"
+  },
+  "devDependencies": {
+    "eslint": "9.27.0",
+    "prettier": "3.5.3",
+    "xo": "0.60.0"
+  }
+}

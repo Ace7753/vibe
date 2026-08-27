@@ -1,0 +1,9 @@
+.env
+config/*
+!config/.gitkeep
+downloads/*
+!downloads/.gitkeep
+__pycache__/
+*.py[cod]
+.venv/
+venv/

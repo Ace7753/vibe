@@ -1,0 +1,21 @@
+# check if there is at least one published port
+
+#! spotdl-app-service.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: spotdl-app-published
+    namespace: spotdl-app
+    labels:
+        com.docker.compose.project: spotdl-app
+        com.docker.compose.service: spotdl-app
+spec:
+    selector:
+        com.docker.compose.project: spotdl-app
+        com.docker.compose.service: spotdl-app
+    ports:
+        - name: spotdl-app-8080
+          port: 8080
+          protocol: TCP
+          targetPort: spotdl-app-8080

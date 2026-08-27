@@ -1,0 +1,179 @@
+"""
+Core data models for Antra.
+"""
+from dataclasses import dataclass, field
+from typing import Any, Optional
+from enum import Enum
+
+
+class AudioFormat(Enum):
+    FLAC = "flac"
+    ALAC = "alac"
+    MP3 = "mp3"
+    AAC = "aac"
+    OPUS = "opus"
+
+
+class DownloadStatus(Enum):
+    PENDING = "pending"
+    DOWNLOADING = "downloading"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class TrackMetadata:
+    """Normalized track metadata from Spotify."""
+    title: str
+    artists: list[str]
+    album: str
+    source_service: Optional[str] = None
+    source_rule: Optional[str] = None
+    request_kind: Optional[str] = None  # "track" | "album" | "playlist"
+    playlist_name: Optional[str] = None
+    playlist_owner: Optional[str] = None
+    playlist_description: Optional[str] = None
+    playlist_position: Optional[int] = None
+    release_year: Optional[int] = None
+    release_date: Optional[str] = None
+    track_number: Optional[int] = None
+    disc_number: Optional[int] = None
+    total_tracks: Optional[int] = None
+    total_discs: Optional[int] = None
+    duration_ms: Optional[int] = None
+    isrc: Optional[str] = None
+    spotify_id: Optional[str] = None
+    album_id: Optional[str] = None
+    spotify_url: Optional[str] = None
+    amazon_asin: Optional[str] = None  # Track ASIN when sourced from Amazon Music URL
+    apple_music_id: Optional[str] = None  # Apple Music catalog track ID, set when input is an Apple Music URL
+    deezer_track_id: Optional[str] = None  # Track ID when sourced from a Deezer URL
+    tidal_track_id: Optional[str] = None  # Tidal track ID when sourced from a Tidal URL
+    upc: Optional[str] = None
+    iswc: Optional[str] = None
+    audio_traits: list[str] = field(default_factory=list)
+    genres: list[str] = field(default_factory=list)
+    album_artists: list[str] = field(default_factory=list)  # Album-level artists (e.g. ["PARTYNEXTDOOR", "Drake"] for joint albums)
+    composer: Optional[str] = None
+    label: Optional[str] = None  # Record label / publisher
+    artwork_url: Optional[str] = None  # Highest res from Spotify
+    playlist_artwork_url: Optional[str] = None  # Playlist-level cover (distinct from track album art)
+    is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
+    available_markets: list[str] = field(default_factory=list)  # Spotify album markets from the full album object
+    available_in_market: Optional[bool] = None  # Availability of the album in cfg.spotify_market (or US fallback)
+    availability_note: Optional[str] = None  # Human-readable market restriction note
+    lyrics: Optional[str] = None
+    synced_lyrics: Optional[str] = None  # LRC format
+
+    @property
+    def primary_artist(self) -> str:
+        return self.artists[0] if self.artists else "Unknown Artist"
+
+    @property
+    def artist_string(self) -> str:
+        return ", ".join(self.artists)
+
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        return self.duration_ms / 1000 if self.duration_ms else None
+
+
+@dataclass
+class SearchResult:
+    """Result from a source adapter search."""
+    source: str
+    title: str
+    artists: list[str]
+    album: Optional[str]
+    duration_ms: Optional[int]
+    audio_format: AudioFormat
+    quality_kbps: Optional[int]  # None for lossless
+    is_lossless: bool
+    download_url: Optional[str]  # Direct URL or None
+    stream_id: Optional[str]     # Source-specific ID for download
+    similarity_score: float = 0.0
+    isrc_match: bool = False
+    artwork_url: Optional[str] = None
+    bit_depth: Optional[int] = None
+    sample_rate_hz: Optional[int] = None
+    is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
+    source_metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def quality_label(self) -> str:
+        fmt = self.audio_format.value.upper()
+        if self.is_lossless:
+            if self.bit_depth and self.sample_rate_hz:
+                return f"{fmt} {self.bit_depth}-bit/{self.sample_rate_hz // 1000}kHz"
+            if self.bit_depth:
+                return f"{fmt} {self.bit_depth}-bit"
+            return fmt
+        if self.quality_kbps:
+            return f"{fmt} {self.quality_kbps}kbps"
+        return fmt
+
+
+@dataclass
+class DownloadResult:
+    """Outcome of a download attempt."""
+    track: TrackMetadata
+    status: DownloadStatus
+    file_path: Optional[str] = None
+    source_used: Optional[str] = None
+    audio_format: Optional[AudioFormat] = None
+    error_message: Optional[str] = None
+    attempt_count: int = 1
+
+
+@dataclass
+class SpotifyPlaylistSummary:
+    """Spotify playlist or collection entry available to the current user."""
+    id: str
+    name: str
+    owner: str
+    total_tracks: int
+    description: str = ""
+    url: Optional[str] = None
+    kind: str = "playlist"
+    is_public: Optional[bool] = None
+    is_collaborative: bool = False
+
+    @property
+    def selection_key(self) -> str:
+        return self.id if self.kind == "playlist" else f"{self.kind}:{self.id}"
+
+
+@dataclass
+class SpotifyLibrary:
+    """Current user library overview for playlist selection flows."""
+    user_id: str
+    display_name: str
+    playlists: list[SpotifyPlaylistSummary] = field(default_factory=list)
+
+
+@dataclass
+class PlaylistFailure:
+    """Per-playlist failure captured during bulk fetch/download."""
+    playlist: SpotifyPlaylistSummary
+    error_message: str
+
+
+@dataclass
+class BulkDownloadProgress:
+    """Progress notification emitted while processing multiple playlists."""
+    playlist: SpotifyPlaylistSummary
+    playlist_index: int
+    playlist_total: int
+    stage: str
+    tracks_completed: int = 0
+    tracks_total: int = 0
+    message: Optional[str] = None
+
+
+@dataclass
+class BulkDownloadReport:
+    """Combined results for a multi-playlist run."""
+    results: list[DownloadResult] = field(default_factory=list)
+    failures: list[PlaylistFailure] = field(default_factory=list)

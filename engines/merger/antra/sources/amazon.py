@@ -1,0 +1,1840 @@
+import base64
+import json
+import logging
+import os
+import random
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from typing import Optional
+
+import requests
+
+from antra.core.amazon_music_fetcher import AmazonMusicFetcher
+from antra.core.models import AudioFormat, SearchResult, TrackMetadata
+from antra.sources.base import BaseSourceAdapter, RateLimitedError
+from antra.sources.odesli import OdesliEnricher
+from antra.utils.matching import score_similarity
+
+logger = logging.getLogger(__name__)
+
+_SOUNDPLATE_SPOTIFY_API = "https://phpstack-822472-6184058.cloudwaysapps.com/api/spotify.php"
+_SOUNDPLATE_REFERER = "https://phpstack-822472-6184058.cloudwaysapps.com/?"
+_SONGLINK_API = "https://api.song.link/v1-alpha.1/links"
+_ISRC_RE = re.compile(r"\b([A-Z]{2}[A-Z0-9]{3}\d{7})\b", re.IGNORECASE)
+_AMAZON_ALBUM_ASIN_RE = re.compile(r"/albums/([A-Z0-9]{10})|\b(B[0-9A-Z]{9})\b")
+_KNOWN_SPOTIFY_AMAZON_ALBUMS = {
+    # song.link/Songstats omit Amazon for this regional release even though
+    # Amazon Music India has a complete public album page.
+    "0xMPyH8Y6b6vtV8lY4kbq1": ["https://music.amazon.in/albums/B0H1CB1M38"],
+}
+
+
+def _humanize_amazon_error(message: str) -> str:
+    text = (message or "").strip()
+    lowered = text.lower()
+    if "contentnotavailable" in lowered:
+        return "[Amazon] This track is not available from the current Amazon marketplace/account."
+    if "no cenc samples found" in lowered or "decryption failed" in lowered:
+        return "[Amazon] Amazon returned an unreadable protected audio stream for this track."
+    if "token expired or geo-restricted" in lowered:
+        return "[Amazon] Amazon could not serve this track right now (token expired or region restricted)."
+    # TLS / connectivity failures (v1.1.8 BUG-2). A raw
+    # "SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER]...'))" blob tells a user
+    # nothing and reads like a server outage, which is the wrong conclusion —
+    # WRONG_VERSION_NUMBER means the bytes coming back are not TLS at all, so
+    # something on the network path (proxy, captive portal, ISP interception, or
+    # a plaintext port behind an https:// URL) answered instead of the mirror.
+    if "wrong_version_number" in lowered or "record layer failure" in lowered:
+        return (
+            "[Amazon] Could not establish a secure connection to the Amazon mirror. "
+            "The server replied with something that isn't HTTPS — this is almost always a "
+            "network issue on your side (a VPN, proxy, corporate firewall, or public Wi-Fi "
+            "portal intercepting the connection), not a server outage. Try disabling any "
+            "proxy/VPN, or switching network."
+        )
+    if "certificate verify failed" in lowered or "certificate_verify_failed" in lowered:
+        return (
+            "[Amazon] The Amazon mirror's security certificate could not be verified. "
+            "This usually means a proxy, antivirus, or corporate firewall is inspecting "
+            "HTTPS traffic. Try disabling HTTPS scanning or switching network."
+        )
+    if "sslerror" in lowered or "ssl:" in lowered or "tlsv1" in lowered:
+        return (
+            "[Amazon] A secure-connection (TLS) error occurred while contacting the Amazon "
+            "mirror. This is usually a local network, VPN, or proxy problem rather than a "
+            "server outage. Try again, or switch network."
+        )
+    if "max retries exceeded" in lowered or "connection refused" in lowered \
+            or "failed to establish a new connection" in lowered \
+            or "name or service not known" in lowered or "nameresolutionerror" in lowered:
+        return (
+            "[Amazon] Could not reach the Amazon mirror. Check your internet connection — "
+            "if you are on a network that blocks unfamiliar domains, a VPN usually fixes this."
+        )
+
+    if text.startswith("[Amazon] All mirrors failed. Last error: "):
+        inner = text.split("Last error:", 1)[1].strip()
+        humanized_inner = _humanize_amazon_error(inner)
+        if humanized_inner != inner:
+            return humanized_inner
+    return text
+
+
+class _TlsFallbackSession:
+    """A `requests.Session` that retries once over curl_cffi's TLS stack when the
+    standard handshake fails (v1.1.8 BUG-2).
+
+    Some users cannot complete a TLS handshake to the mirrors from `requests`
+    (OpenSSL) while the very same track downloads fine elsewhere — typically a
+    middlebox that dislikes Python's TLS fingerprint, or an interception proxy.
+    curl_cffi is already bundled (it is used for the Spotify metadata proxy and
+    podcast paths) and presents a real Chrome fingerprint, so it frequently
+    succeeds where OpenSSL does not.
+
+    Deliberately scoped to NON-streaming GETs. The reported failure is the
+    `/api/track/{asin}` metadata call, and keeping streaming downloads on
+    `requests` avoids swapping response objects underneath the `with ... as r`
+    streaming path.
+    """
+
+    def __init__(self) -> None:
+        self._s = requests.Session()
+        self._curl_unavailable = False
+
+    @property
+    def headers(self):
+        return self._s.headers
+
+    def _curl_get(self, url: str, **kwargs):
+        if self._curl_unavailable:
+            return None
+        try:
+            from curl_cffi import requests as _curl
+        except Exception:
+            self._curl_unavailable = True
+            return None
+        try:
+            merged = dict(self._s.headers)
+            merged.update(kwargs.pop("headers", None) or {})
+            timeout = kwargs.pop("timeout", 30)
+            if isinstance(timeout, tuple):
+                timeout = max(timeout)
+            kwargs.pop("stream", None)
+            resp = _curl.get(
+                url,
+                headers=merged,
+                timeout=timeout,
+                impersonate="chrome124",
+                **kwargs,
+            )
+            logger.info("[Amazon] TLS fallback via curl_cffi succeeded for %s", url)
+            return resp
+        except Exception as e:
+            logger.debug("[Amazon] curl_cffi TLS fallback also failed for %s: %s", url, e)
+            return None
+
+    @staticmethod
+    def _log_proxy_diagnostics(url: str) -> None:
+        """Surface an active proxy when TLS fails (v1.1.8 BUG-2).
+
+        `requests.Session.trust_env` defaults to True, so a system/WinINET or
+        environment proxy is picked up silently. An intercepting proxy answering
+        on 443 is one of the likeliest explanations for WRONG_VERSION_NUMBER, and
+        the user has no way to know one is in play. We deliberately do NOT disable
+        proxy inheritance — plenty of users legitimately need it — we just make it
+        visible in the log so the report is actionable.
+        """
+        try:
+            from requests.utils import get_environ_proxies
+            proxies = get_environ_proxies(url, no_proxy=None)
+        except Exception:
+            return
+        if proxies:
+            logger.warning(
+                "[Amazon] A proxy is configured for this connection (%s). "
+                "If downloads keep failing with a secure-connection error, this proxy "
+                "is the most likely cause.",
+                ", ".join(f"{k}={v}" for k, v in proxies.items()),
+            )
+
+    def get(self, url, **kwargs):
+        try:
+            return self._s.get(url, **kwargs)
+        except requests.exceptions.SSLError as e:
+            if kwargs.get("stream"):
+                self._log_proxy_diagnostics(url)
+                raise
+            logger.warning(
+                "[Amazon] TLS handshake failed for %s (%s) — retrying with an "
+                "alternate TLS stack", url, str(e)[:120],
+            )
+            self._log_proxy_diagnostics(url)
+            resp = self._curl_get(url, **kwargs)
+            if resp is None:
+                raise
+            return resp
+
+
+def _first_isrc(value: str) -> Optional[str]:
+    match = _ISRC_RE.search((value or "").upper())
+    return match.group(1).strip() if match else None
+
+
+def _extract_amazon_album_url(value: str) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if "music.amazon." in raw and "/albums/" in raw:
+        return raw
+    match = _AMAZON_ALBUM_ASIN_RE.search(raw)
+    if not match:
+        return None
+    asin = match.group(1) or match.group(2)
+    return f"https://music.amazon.com/albums/{asin}" if asin else None
+
+
+class _DirectAmazonClient:
+    """
+    Direct Amazon Music DMLS/Widevine client — no proxy server needed.
+    Ports core logic from API-Mirrors/amazon_api/amazon_server.py.
+    Credentials JSON schema: {cookie, authorization, csrf_token, csrf_rnd,
+    csrf_ts, customer_id, device_id, session_id, wvd_path}
+    """
+
+    # Amazon marketplace IDs by country code.
+    # Used when marketplace_id is not stored in the credentials JSON.
+    _MARKETPLACE_IDS = {
+        "us": ("ATVPDKIKX0DER", "US"),
+        "br": ("A2Q3Y263D00KWC", "BR"),
+        "ca": ("A2EUQ1WTGCTBG2", "CA"),
+        "mx": ("A1AM78C64UM0Y8", "MX"),
+        "gb": ("A1F83G8C2ARO7P", "GB"),
+        "de": ("A1PA6795UKMFR9", "DE"),
+        "fr": ("A13V1IB3VIYZZH", "FR"),
+        "it": ("APJ6JRA9NG5V4",  "IT"),
+        "es": ("A1RKKUPIHCS9HS", "ES"),
+        "jp": ("A1VC38T7YXB528", "JP"),
+        "au": ("A39IBJ37TRP1C6", "AU"),
+        "in": ("A21TJRUUN4KGV",  "IN"),
+    }
+
+    # Amazon Music regional storefront URLs by country code.
+    _STOREFRONT_URLS = {
+        "us": "https://music.amazon.com/",
+        "br": "https://music.amazon.com.br/",
+        "ca": "https://music.amazon.ca/",
+        "mx": "https://music.amazon.com.mx/",
+        "gb": "https://music.amazon.co.uk/",
+        "de": "https://music.amazon.de/",
+        "fr": "https://music.amazon.fr/",
+        "it": "https://music.amazon.it/",
+        "es": "https://music.amazon.es/",
+        "jp": "https://music.amazon.co.jp/",
+        "au": "https://music.amazon.com.au/",
+        "in": "https://music.amazon.in/",
+    }
+    _DMLS_URL = "https://music.amazon.com/NA/api/dmls/"
+
+    # Regional DMLS API endpoints. The path segment reflects Amazon's internal
+    # region grouping, not the country code directly.
+    _DMLS_URLS = {
+        "us": "https://music.amazon.com/NA/api/dmls/",
+        "ca": "https://music.amazon.com/NA/api/dmls/",
+        "mx": "https://music.amazon.com/NA/api/dmls/",
+        "br": "https://music.amazon.com.br/NA/api/dmls/",
+        "gb": "https://music.amazon.co.uk/EU/api/dmls/",
+        "de": "https://music.amazon.de/EU/api/dmls/",
+        "fr": "https://music.amazon.fr/EU/api/dmls/",
+        "it": "https://music.amazon.it/EU/api/dmls/",
+        "es": "https://music.amazon.es/EU/api/dmls/",
+        "jp": "https://music.amazon.co.jp/FE/api/dmls/",
+        "au": "https://music.amazon.com.au/FE/api/dmls/",
+        "in": "https://music.amazon.in/IN/api/dmls/",
+    }
+
+    def _get_dmls_url(self) -> str:
+        """Return the correct regional DMLS endpoint for the configured marketplace."""
+        cc = (self._creds or {}).get("country_code", "us").strip().lower()
+        return self._DMLS_URLS.get(cc, self._DMLS_URL)
+
+    def __init__(self, creds_json: str):
+        self._creds: Optional[dict] = None
+        if creds_json.strip():
+            try:
+                self._creds = json.loads(creds_json)
+            except Exception:
+                logger.warning("[Amazon-Direct] Invalid credentials JSON — ignoring")
+
+    def is_configured(self) -> bool:
+        if not self._creds:
+            return False
+        # customer_id and device_id are optional — not all Amazon sessions expose them
+        # and they are not required for DMLS API calls.
+        required = ("cookie", "authorization", "csrf_token", "wvd_path")
+        return all(self._creds.get(k) for k in required)
+
+    def _get_marketplace(self) -> tuple[str, str]:
+        """
+        Return (marketplaceId, territoryId) for the DMLS API.
+        Priority:
+          1. Explicit marketplace_id + territory_id fields in the credentials JSON
+          2. country_code field in credentials JSON → looked up in _MARKETPLACE_IDS
+          3. Default: US
+        Users on non-US storefronts (e.g. Brazil) should add
+        "country_code": "br" to their credentials JSON, or set
+        "marketplace_id": "A2Q3Y263D00KWC" and "territory_id": "BR" directly.
+        """
+        c = self._creds or {}
+        mid = c.get("marketplace_id", "").strip()
+        tid = c.get("territory_id", "").strip()
+        if mid and tid:
+            return mid, tid
+        cc = c.get("country_code", "us").strip().lower()
+        return self._MARKETPLACE_IDS.get(cc, ("ATVPDKIKX0DER", "US"))
+
+    def _safe_json_loads(self, text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            fixed = self._INVALID_ESCAPE_RE.sub(lambda m: "\\\\" + m.group(0), text)
+            return json.loads(fixed)
+
+    def _build_headers(self) -> dict:
+        c = self._creds
+        # Use the regional storefront URL for Origin/Referer
+        cc = (c or {}).get("country_code", "us").strip().lower()
+        storefront = self._STOREFRONT_URLS.get(cc, "https://music.amazon.com/")
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "Origin": storefront.rstrip("/"),
+            "Referer": storefront,
+            "Cookie": c["cookie"],
+            "content-type": "application/json",
+            "Content-Encoding": "amz-1.0",
+            "csrf-token": c["csrf_token"],
+            "csrf-rnd": c.get("csrf_rnd", ""),
+            "csrf-ts": c.get("csrf_ts", ""),
+            "Authorization": c["authorization"],
+        }
+
+    def _get_manifest(self, asin: str) -> dict:
+        headers = self._build_headers()
+        headers["X-Amz-Target"] = (
+            "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getDashManifestsV2"
+        )
+        c = self._creds
+        customer_id = c.get("customer_id") or ""
+        device_id = c.get("device_id") or "antra-web-player"
+        mid, tid = self._get_marketplace()
+        payload = {
+            "deviceToken": {"deviceTypeId": "A16ZV8BU3SN1N3", "deviceId": device_id},
+            "appMetadata": {"https": "true"},
+            "clientMetadata": {
+                "clientId": "WebCP",
+                "clientRequestId": f"{random.randint(10**8, 10**9-1):09x}-3d00-11f1-8fb8-0b4e12d5b57b",
+            },
+            "contentIdList": [{"identifier": asin, "identifierType": "ASIN"}],
+            "musicDashVersionList": ["SIREN_KATANA_NO_CLEAR_LEAD"],
+            "contentProtectionList": ["TRACK_PSSH"],
+            "tryAsinSubstitution": True,
+            "customerInfo": {"marketplaceId": mid, "territoryId": tid},
+            "appInfo": {"musicAgent": "Maestro/1.0 WebCP/1.0.10034.0 (7dbf-196c-WebC-2b70-7689c)"},
+        }
+        # Only include customerId if we have it — omitting it avoids 400 errors
+        # when the field is an empty string.
+        if customer_id:
+            payload["customerId"] = customer_id
+        r = requests.post(self._get_dmls_url(), headers=headers, json=payload, timeout=20)
+        if r.status_code == 401:
+            raise RuntimeError(
+                "[Amazon-Direct] Authorization expired (401) — re-extract credentials from music.amazon.com"
+            )
+        if r.status_code != 200:
+            raise RuntimeError(f"[Amazon-Direct] Manifest request failed: {r.status_code}")
+        result = self._safe_json_loads(r.text)
+        # Check for application-level errors in the response
+        content_list = result.get("contentResponseList") or []
+        if content_list:
+            status = content_list[0].get("statusCode") or content_list[0].get("errorCode") or ""
+            if status and status not in ("OK", "SUCCESS", "200", ""):
+                raise RuntimeError(
+                    f"[Amazon-Direct] Track not available in marketplace {mid}/{tid}: {status}"
+                )
+        return result
+
+    def _parse_manifest(self, data: dict) -> tuple[str, str]:
+        try:
+            content_list = data.get("contentResponseList") or []
+            if not content_list:
+                raise RuntimeError("[Amazon-Direct] Empty contentResponseList — track may not be available in this marketplace")
+            manifest_xml = content_list[0].get("manifest", "")
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"[Amazon-Direct] Unexpected manifest structure: {e}")
+
+        if not manifest_xml or not manifest_xml.strip():
+            # Log the full response keys to help diagnose
+            keys = list((data.get("contentResponseList") or [{}])[0].keys()) if data.get("contentResponseList") else list(data.keys())
+            raise RuntimeError(
+                f"[Amazon-Direct] Empty manifest — track ASIN may not be available in the configured marketplace "
+                f"(marketplaceId={self._get_marketplace()[0]}). Response keys: {keys}"
+            )
+
+        root = ET.fromstring(manifest_xml)
+        ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011", "cenc": "urn:mpeg:cenc:2013"}
+        best_pssh = best_url = None
+        best_score = -1
+
+        for adaptation_set in root.findall(".//mpd:AdaptationSet", ns):
+            priority = int(adaptation_set.get("selectionPriority", 0))
+            for rep in adaptation_set.findall("mpd:Representation", ns):
+                if "flac" not in rep.get("codecs", ""):
+                    continue
+                bd_prop = rep.find('.//mpd:SupplementalProperty[@schemeIdUri="amz-music:bitDepth"]', ns)
+                bit_depth = int(bd_prop.get("value", 16)) if bd_prop is not None else 16
+                score = priority * 100 + bit_depth
+                if score > best_score:
+                    best_score = score
+                    pssh_el = adaptation_set.find(".//cenc:pssh", ns)
+                    best_pssh = pssh_el.text.strip() if pssh_el is not None else None
+                    base_url_el = rep.find("mpd:BaseURL", ns)
+                    best_url = base_url_el.text.strip() if base_url_el is not None else None
+
+        if not best_pssh or not best_url:
+            raise RuntimeError("[Amazon-Direct] No FLAC stream found in manifest")
+        return best_url, best_pssh
+
+    def _get_license_key(self, pssh_b64: str) -> str:
+        try:
+            from pywidevine.cdm import Cdm
+            from pywidevine.device import Device
+            from pywidevine.pssh import PSSH
+        except ImportError:
+            raise RuntimeError(
+                "[Amazon-Direct] pywidevine not installed — run: pip install pywidevine==1.8.0 construct==2.8.8"
+            )
+
+        c = self._creds
+        wvd_path = c.get("wvd_path", "")
+        if not wvd_path:
+            raise RuntimeError("[Amazon-Direct] No wvd_path in credentials JSON")
+
+        device = Device.load(wvd_path)
+        cdm = Cdm.from_device(device)
+        session_id = cdm.open()
+        try:
+            pssh = PSSH(pssh_b64)
+            challenge = cdm.get_license_challenge(session_id, pssh)
+            b64_challenge = base64.b64encode(challenge).decode()
+
+            bearer = c["authorization"].removeprefix("Bearer ")
+            customer_id = c.get("customer_id") or ""
+            device_id = c.get("device_id") or "antra-web-player"
+            session_id_str = c.get("session_id") or ""
+            payload = {
+                "DrmType": "WIDEVINE",
+                "licenseChallenge": b64_challenge,
+                "deviceToken": {"deviceTypeId": "A16ZV8BU3SN1N3", "deviceId": device_id},
+                "appInfo": {"musicAgent": "Maestro/1.0 WebCP/1.0.10034.0 (7dbf-196c-WebC-2b70-7689c)"},
+                "Authorization": c["authorization"],
+            }
+            if customer_id:
+                payload["customerId"] = customer_id
+            headers = self._build_headers()
+            headers["X-Amz-Target"] = (
+                "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getLicenseForPlaybackV2"
+            )
+            headers["x-amzn-authentication"] = json.dumps({
+                "interface": "ClientAuthenticationInterface.v1_0.ClientTokenElement",
+                "accessToken": f"Bearer {bearer}",
+            })
+            headers["x-amzn-device-model"] = "WEBPLAYER"
+            headers["x-amzn-device-family"] = "WebPlayer"
+            headers["x-amzn-device-id"] = device_id
+            headers["x-amzn-session-id"] = session_id_str
+            headers["x-amzn-device-language"] = "en_US"
+            headers["x-amzn-application-version"] = "1.0.10034.0"
+            headers["x-amzn-os-version"] = "1.0"
+
+            r = requests.post(self._get_dmls_url(), json=payload, headers=headers, timeout=20)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"[Amazon-Direct] License request failed: {r.status_code} {r.text[:200]}"
+                )
+            rj = r.json()
+            if "license" not in rj:
+                raise RuntimeError(f"[Amazon-Direct] No license in response: {list(rj.keys())}")
+
+            license_bytes = base64.b64decode(rj["license"])
+            cdm.parse_license(session_id, license_bytes)
+            keys = cdm.get_keys(session_id)
+        finally:
+            cdm.close(session_id)
+
+        content_keys = [k for k in keys if k.type == "CONTENT"]
+        if not content_keys:
+            raise RuntimeError("[Amazon-Direct] No CONTENT keys in license response")
+        return content_keys[0].key.hex()
+
+    def process_track(self, asin: str) -> dict:
+        """Returns {"streamUrl": str, "decryptionKey": str}."""
+        data = self._get_manifest(asin)
+        stream_url, pssh_b64 = self._parse_manifest(data)
+        key_hex = self._get_license_key(pssh_b64)
+        return {"streamUrl": stream_url, "decryptionKey": key_hex}
+
+# On Windows, prevent subprocess from flashing a console window
+_SUBPROCESS_FLAGS = {}
+if sys.platform == "win32":
+    _SUBPROCESS_FLAGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+
+class AmazonAdapter(BaseSourceAdapter):
+    """
+    Amazon Music adapter using a community stream proxy pool.
+    Requires ffmpeg for decryption.
+    """
+
+    name = "amazon"
+
+    def __init__(
+        self,
+        mirrors: list[str],
+        api_key: Optional[str] = None,
+        direct_creds_json: str = "",
+        mirror_api_key: str = "",
+        preferred_output_format: str = "source",
+    ):
+        self._session = _TlsFallbackSession()
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        })
+        # Inject API key for self-hosted mirror servers
+        if mirror_api_key:
+            self._session.headers["X-API-Key"] = mirror_api_key
+        self._odesli = OdesliEnricher(api_key=api_key)
+        self.priority = 2  # Shared free-lossless tier with Apple/HiFi
+        self._preferred_output_format = (preferred_output_format or "source").lower()
+        self._prefer_lossy_download = self._preferred_output_format in {"mp3", "aac", "m4a"}
+        self._requires_atmos = self._preferred_output_format == "atmos-amazon"
+        self._album_track_cache: dict[str, list[TrackMetadata]] = {}
+        self._spotify_isrc_cache: dict[str, str] = {}
+        self._spotify_isrc_lock = threading.Lock()
+
+        # Mirror management. Schemes are normalized here (v1.1.8 BUG-2): the
+        # mirror list arrives from a remote gist manifest and nothing downstream
+        # validated it, so a scheme-less entry ("amazon.example.cfd") reached
+        # requests as a MissingSchema crash, and an "http://" entry silently
+        # downgraded the connection. A plaintext port behind an https:// URL is
+        # also one of the few things that genuinely produces WRONG_VERSION_NUMBER,
+        # so localhost/127.0.0.1 entries are deliberately left on http.
+        # Dedupe AFTER normalization: the incoming list is deduped on its raw
+        # strings, so "host", "http://host" and "https://host/" survive as three
+        # entries and only collapse once normalized. Without this the pool would
+        # treat one host as three mirrors, burning retries and skewing the
+        # per-mirror failure counts.
+        self._mirrors = []
+        _seen_mirrors: set[str] = set()
+        for _raw in mirrors:
+            _norm = self._normalize_mirror_url(_raw)
+            if _norm and _norm not in _seen_mirrors:
+                _seen_mirrors.add(_norm)
+                self._mirrors.append(_norm)
+        self._current_mirror: Optional[str] = None
+        self._mirror_failures: dict[str, int] = {}
+
+        # Direct auth client (user's own Amazon Music account — preferred over mirrors)
+        self._direct = _DirectAmazonClient(direct_creds_json) if direct_creds_json.strip() else None
+        if self._direct and self._direct.is_configured():
+            logger.info("[Amazon-Direct] Direct credentials loaded — will use DMLS API directly")
+
+
+    @staticmethod
+    def _normalize_mirror_url(raw: str) -> Optional[str]:
+        """Normalize one mirror entry to a usable https URL, or drop it.
+
+        Loopback hosts stay on http: the local mirror servers speak plaintext, and
+        pointing https:// at a plaintext port is itself a cause of
+        `WRONG_VERSION_NUMBER` (v1.1.8 BUG-2).
+        """
+        url = (raw or "").strip().rstrip("/")
+        if not url:
+            return None
+        host_part = url.split("://", 1)[1] if "://" in url else url
+        is_loopback = host_part.startswith(("127.0.0.1", "localhost", "[::1]", "0.0.0.0"))
+        if "://" not in url:
+            url = ("http://" if is_loopback else "https://") + url
+            logger.debug("[Amazon] Mirror entry had no scheme — assuming %s", url)
+        elif url.startswith("http://") and not is_loopback:
+            upgraded = "https://" + url[len("http://"):]
+            logger.warning(
+                "[Amazon] Mirror %s is configured as plaintext http:// — upgrading to https. "
+                "A plaintext URL against a TLS port is a known cause of connection errors.",
+                url,
+            )
+            url = upgraded
+        elif not url.startswith(("http://", "https://")):
+            logger.warning("[Amazon] Ignoring mirror entry with unsupported scheme: %s", url)
+            return None
+        return url
+
+    def _get_working_mirror(self, force_rotate: bool = False) -> str:
+        """
+        Return a working mirror from the pool. 
+        If force_rotate is True, it skips the current mirror.
+        """
+        if self._current_mirror and not force_rotate:
+            return self._current_mirror
+
+        # Filter out mirrors that have failed too many times recently
+        valid_mirrors = [m for m in self._mirrors if self._mirror_failures.get(m, 0) < 3]
+        if not valid_mirrors:
+            logger.debug("[Amazon] All mirrors failed health checks. Resetting pool.")
+            valid_mirrors = self._mirrors
+            self._mirror_failures.clear()
+
+        # Try to find a responsive mirror
+        for mirror in valid_mirrors:
+            if mirror == self._current_mirror and force_rotate:
+                continue
+                
+            try:
+                # Quick health check — 15s to match Tidal/Qobuz/Deezer mirror adapters
+                # (Cloudflare Tunnel latency from India can exceed 5s on cold-starts)
+                resp = self._session.get(mirror + "/", timeout=15)
+                if resp.status_code in (200, 404):
+                    self._current_mirror = mirror
+                    logger.debug(f"[Amazon] Using mirror: {mirror}")
+                    return mirror
+            except Exception as e:
+                logger.debug(f"[Amazon] Mirror {mirror} unreachable: {e}")
+                self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+
+        if self._mirrors:
+            # Fallback to the first mirror if all checks fail
+            return self._mirrors[0]
+        
+        raise RuntimeError("[Amazon] No mirrors configured.")
+
+    def is_available(self) -> bool:
+        """Check if ffmpeg is installed and at least one download path is ready."""
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
+            subprocess.run([ffmpeg, "-version"], capture_output=True, check=True, **_SUBPROCESS_FLAGS)
+        except Exception:
+            return False
+
+        if self._direct and self._direct.is_configured():
+            return True
+        if self._mirrors:
+            try:
+                self._get_working_mirror()
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _resolve_via_mirror(self, track: TrackMetadata) -> tuple[Optional[str], Optional[dict]]:
+        """
+        Ask the self-hosted Amazon mirror to resolve Spotify IDs.
+
+        The mirror resolves inside the same account/marketplace environment that
+        later serves the stream, and it returns a ready stream payload we can reuse
+        during download.
+        """
+        spotify_id = (getattr(track, "spotify_id", "") or "").strip()
+        spotify_url = (getattr(track, "spotify_url", "") or "").strip()
+        if not spotify_url and spotify_id:
+            spotify_url = f"https://open.spotify.com/track/{spotify_id}"
+        if not spotify_id and not spotify_url:
+            return None, None
+
+        try:
+            mirror = self._get_working_mirror()
+        except Exception as e:
+            logger.debug("[Amazon] Mirror resolve unavailable: %s", e)
+            return None, None
+
+        try:
+            if spotify_id:
+                resp = self._session.get(f"{mirror}/api/resolve/spotify/{spotify_id}", timeout=45)
+            else:
+                resp = self._session.get(f"{mirror}/api/resolve", params={"url": spotify_url}, timeout=45)
+            if resp.status_code == 429:
+                raise RateLimitedError("Amazon mirror rate limited (429)")
+            if resp.status_code in (401, 403):
+                logger.warning("[Amazon] API key rejected (%d) — check key on server", resp.status_code)
+                return None, None
+            if resp.status_code == 503:
+                self._current_mirror = None
+                return None, None
+            if resp.status_code == 404:
+                return None, None
+            resp.raise_for_status()
+            data = resp.json()
+        except RateLimitedError:
+            raise
+        except Exception as e:
+            logger.debug("[Amazon] Mirror resolve failed for '%s': %s", track.title, e)
+            return None, None
+
+        asin = str(data.get("asin") or data.get("id") or "").strip()
+        if not asin:
+            return None, None
+        logger.info("[Amazon] Mirror resolved Spotify track '%s' to ASIN %s", track.title, asin)
+        return asin, data
+
+    @staticmethod
+    def _clean_search_title(title: str) -> str:
+        cleaned = re.sub(
+            r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+            "",
+            title or "",
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _verify_scraped_asin(
+        self, track: TrackMetadata, asin: str, base: str
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
+        """Fetch the Amazon track page for a scraped ASIN and verify it actually
+        matches the requested track (title/artist similarity + duration). Search
+        result pages contain ASINs for related tracks, karaoke covers and ads —
+        the first ASIN in the HTML is frequently a completely different song
+        (v1.1.8 BUG-1, 'random instrumentals')."""
+        try:
+            fetcher = AmazonMusicFetcher()
+            candidates = fetcher.fetch(f"{base}/tracks/{asin}")
+        except Exception as e:
+            logger.debug("[Amazon] Scraped-ASIN verification fetch failed for %s: %s", asin, e)
+            return None
+        if not candidates:
+            return None
+        candidate = candidates[0]
+        if not self._candidate_duration_ok(track, candidate):
+            logger.info(
+                "[Amazon] Scraped ASIN %s rejected for '%s' — duration mismatch "
+                "(candidate '%s' %.0fs vs expected %.0fs)",
+                asin, track.title, candidate.title,
+                (candidate.duration_ms or 0) / 1000, (track.duration_ms or 0) / 1000,
+            )
+            return None
+        score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+        if score < 0.60:
+            logger.info(
+                "[Amazon] Scraped ASIN %s rejected for '%s' — page is '%s' by '%s' (score=%.2f)",
+                asin, track.title, candidate.title, candidate.primary_artist, score,
+            )
+            return None
+        return asin, score, candidate
+
+    def _search_amazon_music_web(
+        self, track: TrackMetadata
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
+        """
+        Fallback ASIN lookup against Amazon Music web pages.
+
+        Odesli/Songwhip are sparse for some regional Spotify catalog entries. The
+        Amazon Music search page often still exposes track links. Every scraped
+        ASIN is verified against its own track page before being accepted —
+        search pages are full of ASINs for unrelated/karaoke/instrumental tracks,
+        and returning the first one unverified shipped wrong audio (v1.1.8 BUG-1).
+        """
+        title = self._clean_search_title(getattr(track, "title", "") or "")
+        if not title:
+            return None
+        artists = [a for a in (getattr(track, "artists", []) or []) if a]
+        artist_queries = []
+        if artists:
+            artist_queries.append(artists[0])
+            joined = " ".join(artists)
+            if joined.lower() != artists[0].lower():
+                artist_queries.append(joined)
+        artist_queries.append("")
+
+        storefronts = [
+            "https://music.amazon.com",
+            "https://music.amazon.in",
+            "https://music.amazon.co.uk",
+            "https://music.amazon.com.br",
+        ]
+        seen_queries: set[str] = set()
+        verified_attempts = 0
+        _MAX_VERIFY_FETCHES = 4  # cap page fetches on this last-resort path
+        checked_asins: set[str] = set()
+        for artist in artist_queries:
+            query = f"{title} {artist}".strip()
+            key = query.lower()
+            if not query or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            encoded = urllib.parse.quote(query)
+            for base in storefronts:
+                try:
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    if not resp.ok:
+                        continue
+                    text = resp.text
+                except Exception as e:
+                    logger.debug("[Amazon] Amazon Music web search failed: %s", e)
+                    continue
+
+                candidates = []
+                candidates.extend(re.findall(r"/tracks/([A-Z0-9]{10})", text))
+                candidates.extend(re.findall(r'"trackAsin"\s*:\s*"([A-Z0-9]{10})"', text))
+                candidates.extend(re.findall(r'"asin"\s*:\s*"([A-Z0-9]{10})"', text))
+                for asin in dict.fromkeys(candidates):
+                    if asin in checked_asins:
+                        continue
+                    checked_asins.add(asin)
+                    if verified_attempts >= _MAX_VERIFY_FETCHES:
+                        return None
+                    verified_attempts += 1
+                    verified = self._verify_scraped_asin(track, asin, base)
+                    if verified:
+                        logger.info(
+                            "[Amazon] Web search resolved '%s' to ASIN %s (verified, score=%.2f)",
+                            track.title, verified[0], verified[1],
+                        )
+                        return verified
+        return None
+
+    @staticmethod
+    def _album_cache_key(track: TrackMetadata) -> Optional[str]:
+        spotify_album_id = (getattr(track, "album_id", "") or "").strip()
+        if spotify_album_id:
+            return f"spotify_album||{spotify_album_id}"
+        album = (getattr(track, "album", "") or "").strip().lower()
+        artist = (getattr(track, "primary_artist", "") or "").strip().lower()
+        if not album:
+            return None
+        return f"{album}||{artist}"
+
+    def _album_urls_via_songlink(self, track: TrackMetadata) -> list[str]:
+        spotify_album_id = (getattr(track, "album_id", "") or "").strip()
+        if not spotify_album_id:
+            return []
+
+        seeded = list(_KNOWN_SPOTIFY_AMAZON_ALBUMS.get(spotify_album_id, []))
+
+        spotify_album_url = f"https://open.spotify.com/album/{spotify_album_id}"
+        try:
+            resp = self._session.get(
+                _SONGLINK_API,
+                params={"url": spotify_album_url, "platform": "spotify", "type": "album"},
+                timeout=10,
+            )
+            if resp.status_code == 429:
+                logger.debug("[Amazon] song.link album lookup rate-limited for %s", spotify_album_id)
+                return seeded
+            if not resp.ok:
+                logger.debug("[Amazon] song.link album lookup HTTP %s for %s", resp.status_code, spotify_album_id)
+                return seeded
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("[Amazon] song.link album lookup failed for %s: %s", spotify_album_id, e)
+            return seeded
+
+        urls: list[str] = []
+        links = payload.get("linksByPlatform", {}) or {}
+        entities = payload.get("entitiesByUniqueId", {}) or {}
+        for platform in ("amazonMusic", "amazon"):
+            link_info = links.get(platform) or {}
+            entity_uid = str(link_info.get("entityUniqueId") or "")
+            entity = entities.get(entity_uid, {}) or {}
+            for raw in (
+                link_info.get("url"),
+                entity.get("url"),
+                entity.get("id"),
+                entity_uid.split("::")[-1] if "::" in entity_uid else entity_uid,
+            ):
+                album_url = _extract_amazon_album_url(str(raw or ""))
+                if album_url and album_url not in urls:
+                    urls.append(album_url)
+
+        for album_url in reversed(seeded):
+            if album_url not in urls:
+                urls.insert(0, album_url)
+        if urls:
+            source = "seed cache" if urls[0] in seeded else "song.link"
+            logger.info("[Amazon] %s resolved Spotify album '%s' to Amazon album %s", source, track.album or spotify_album_id, urls[0])
+        return urls
+
+    def _fetch_album_tracks_from_urls(self, track: TrackMetadata, album_urls: list[str]) -> list[TrackMetadata]:
+        if not album_urls:
+            return []
+
+        fetcher = AmazonMusicFetcher()
+        best_tracks: list[TrackMetadata] = []
+        best_score = 0.0
+        for album_url in album_urls:
+            try:
+                album_tracks = fetcher.fetch(album_url)
+            except Exception as e:
+                logger.debug("[Amazon] Amazon album fetch failed for %s: %s", album_url, e)
+                continue
+            if not album_tracks:
+                continue
+
+            sample = album_tracks[0]
+            album_score = score_similarity(
+                track.album or "",
+                [track.primary_artist] if track.primary_artist else [],
+                sample.album or "",
+                sample.primary_artist,
+            )
+            if album_score > best_score:
+                best_score = album_score
+                best_tracks = album_tracks
+            if album_score >= 0.60:
+                return album_tracks
+        return best_tracks
+
+    def _fetch_amazon_album_candidates(self, track: TrackMetadata) -> list[TrackMetadata]:
+        cache_key = self._album_cache_key(track)
+        if cache_key and cache_key in self._album_track_cache:
+            return self._album_track_cache[cache_key]
+
+        album = (getattr(track, "album", "") or "").strip()
+        if not album:
+            return []
+
+        songlink_tracks = self._fetch_album_tracks_from_urls(track, self._album_urls_via_songlink(track))
+        if songlink_tracks:
+            if cache_key:
+                self._album_track_cache[cache_key] = songlink_tracks
+            return songlink_tracks
+
+        artist_candidates = []
+        primary_artist = (getattr(track, "primary_artist", "") or "").strip()
+        if primary_artist:
+            artist_candidates.append(primary_artist)
+        for artist in (getattr(track, "album_artists", []) or []):
+            artist = (artist or "").strip()
+            if artist and artist.lower() not in {a.lower() for a in artist_candidates}:
+                artist_candidates.append(artist)
+        if not artist_candidates:
+            artist_candidates.append("")
+
+        storefronts = [
+            "https://music.amazon.com",
+            "https://music.amazon.in",
+            "https://music.amazon.co.uk",
+            "https://music.amazon.com.br",
+        ]
+        fetcher = AmazonMusicFetcher()
+        seen_album_asins: set[str] = set()
+        best_tracks: list[TrackMetadata] = []
+        best_score = 0.0
+
+        for artist in artist_candidates:
+            query = f"{album} {artist}".strip()
+            encoded = urllib.parse.quote(query)
+            for base in storefronts:
+                try:
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    if not resp.ok:
+                        continue
+                    text = resp.text
+                except Exception as e:
+                    logger.debug("[Amazon] Amazon album search failed: %s", e)
+                    continue
+
+                album_asins = []
+                album_asins.extend(re.findall(r"/albums/([A-Z0-9]{10})", text))
+                album_asins.extend(re.findall(r'"albumAsin"\s*:\s*"([A-Z0-9]{10})"', text))
+                for album_asin in dict.fromkeys(album_asins):
+                    if album_asin in seen_album_asins:
+                        continue
+                    seen_album_asins.add(album_asin)
+                    album_url = f"{base}/albums/{album_asin}"
+                    try:
+                        album_tracks = fetcher.fetch(album_url)
+                    except Exception as e:
+                        logger.debug("[Amazon] Amazon album fetch failed for %s: %s", album_url, e)
+                        continue
+                    if not album_tracks:
+                        continue
+
+                    sample = album_tracks[0]
+                    album_score = score_similarity(
+                        track.album or "",
+                        [track.primary_artist] if track.primary_artist else [],
+                        sample.album or "",
+                        sample.primary_artist,
+                    )
+                    if album_score > best_score:
+                        best_score = album_score
+                        best_tracks = album_tracks
+                    if album_score >= 0.75:
+                        if cache_key:
+                            self._album_track_cache[cache_key] = album_tracks
+                        return album_tracks
+
+        if cache_key:
+            self._album_track_cache[cache_key] = best_tracks
+        return best_tracks
+
+    @staticmethod
+    def _candidate_duration_ok(track: TrackMetadata, candidate: TrackMetadata) -> bool:
+        """Reject candidates whose declared duration is severely off the
+        requested track's — a positional/title match on a different recording."""
+        if not track.duration_ms or not getattr(candidate, "duration_ms", None):
+            return True
+        expected_s = track.duration_ms / 1000.0
+        actual_s = candidate.duration_ms / 1000.0
+        shorter = actual_s < expected_s * 0.8 and (expected_s - actual_s) >= 20
+        longer = actual_s > expected_s * 1.3 and (actual_s - expected_s) >= 45
+        return not (shorter or longer)
+
+    def _resolve_via_album_page(
+        self, track: TrackMetadata
+    ) -> Optional[tuple[str, float, TrackMetadata]]:
+        """Resolve a track against the matched Amazon album page's tracklist.
+
+        Returns (asin, match_score, matched_candidate) so search() can report an
+        HONEST similarity score and the candidate's real title/artist/duration —
+        never a fabricated 1.0 (v1.1.8 BUG-1).
+        """
+        album_tracks = self._fetch_amazon_album_candidates(track)
+        if not album_tracks:
+            return None
+
+        if track.track_number:
+            for candidate in album_tracks:
+                if candidate.track_number != track.track_number:
+                    continue
+                score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+                if score >= 0.60 and candidate.amazon_asin and self._candidate_duration_ok(track, candidate):
+                    logger.info(
+                        "[Amazon] Album-page match resolved '%s' to ASIN %s (score=%.2f)",
+                        track.title, candidate.amazon_asin, score,
+                    )
+                    return candidate.amazon_asin, score, candidate
+
+        best: Optional[tuple[str, float, TrackMetadata]] = None
+        best_score = 0.0
+        for candidate in album_tracks:
+            if not candidate.amazon_asin:
+                continue
+            if not self._candidate_duration_ok(track, candidate):
+                continue
+            score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+            if score > best_score:
+                best_score = score
+                best = (candidate.amazon_asin, score, candidate)
+
+        if best and best_score >= 0.72:
+            logger.info(
+                "[Amazon] Fuzzy album-page match resolved '%s' to ASIN %s (score=%.2f)",
+                track.title, best[0], best_score,
+            )
+            return best
+        return None
+
+    def _lookup_spotify_isrc_via_soundplate(self, spotify_id: str) -> Optional[str]:
+        spotify_id = (spotify_id or "").strip()
+        if not spotify_id:
+            return None
+
+        spotify_url = f"https://open.spotify.com/track/{spotify_id}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Referer": _SOUNDPLATE_REFERER,
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+            "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=1, i",
+        }
+        try:
+            resp = self._session.get(
+                _SOUNDPLATE_SPOTIFY_API,
+                params={"q": spotify_url},
+                headers=headers,
+                timeout=8,
+            )
+            if not resp.ok:
+                logger.debug("[Amazon] Soundplate Spotify lookup HTTP %s for %s", resp.status_code, spotify_id)
+                return None
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            isrc = _first_isrc(str(payload.get("isrc") or ""))
+            if not isrc:
+                isrc = _first_isrc(resp.text)
+            return isrc
+        except Exception as e:
+            logger.debug("[Amazon] Soundplate Spotify lookup failed for %s: %s", spotify_id, e)
+            return None
+
+    def _ensure_spotify_isrc(self, track: TrackMetadata) -> None:
+        if getattr(track, "isrc", None):
+            return
+        spotify_id = (getattr(track, "spotify_id", "") or "").strip()
+        if not spotify_id:
+            return
+
+        with self._spotify_isrc_lock:
+            cached = self._spotify_isrc_cache.get(spotify_id)
+        if cached:
+            track.isrc = cached
+            return
+
+        isrc = self._lookup_spotify_isrc_via_soundplate(spotify_id)
+        if isrc:
+            track.isrc = isrc
+            with self._spotify_isrc_lock:
+                self._spotify_isrc_cache[spotify_id] = isrc
+
+    def search(self, track: TrackMetadata) -> Optional[SearchResult]:
+        """
+        Resolve track to Amazon Music ASIN.
+        Uses the ASIN already on the track (when sourced from an Amazon Music URL)
+        or falls back to mirror / Odesli / album-page / web-search resolution.
+
+        The similarity score reflects HOW the ASIN was resolved (v1.1.8 BUG-1) —
+        previously every path claimed similarity_score=1.0 and isrc_match=True,
+        which made a first-ASIN-in-HTML web scrape indistinguishable from an
+        exact platform ID and let wrong songs through every resolver gate.
+        """
+        amazon_id = getattr(track, "amazon_asin", None)
+        resolved_payload: Optional[dict] = None
+        # Provenance of the resolution — controls the honesty of the result.
+        similarity: float = 1.0
+        isrc_verified: bool = bool(track.isrc)
+        matched_title: str = track.title
+        matched_artists: list[str] = list(track.artists or [])
+        matched_duration_ms: Optional[int] = track.duration_ms
+        matched_album: Optional[str] = None
+
+        if amazon_id:
+            # Exact platform ID from an Amazon Music URL — genuinely authoritative.
+            logger.debug(f"[Amazon] Using embedded ASIN for '{track.title}': {amazon_id}")
+        else:
+            amazon_id, resolved_payload = self._resolve_via_mirror(track)
+            if amazon_id:
+                # Mirror resolves inside Amazon's own marketplace index — strong,
+                # but it is a cross-platform mapping, not an ISRC verification.
+                similarity = 0.95
+                isrc_verified = False
+            if not amazon_id:
+                self._ensure_spotify_isrc(track)
+                logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
+                platform_ids = self._odesli.resolve(track)
+                amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
+                if amazon_id:
+                    # Cross-platform link index — usually right, occasionally maps
+                    # to a different release. Strong but not perfect confidence.
+                    similarity = 0.90
+                    isrc_verified = False
+            if not amazon_id:
+                album_match = self._resolve_via_album_page(track)
+                if album_match:
+                    amazon_id, similarity, candidate = album_match
+                    isrc_verified = False
+                    matched_title = candidate.title or matched_title
+                    if candidate.artists:
+                        matched_artists = list(candidate.artists)
+                    if getattr(candidate, "duration_ms", None):
+                        matched_duration_ms = candidate.duration_ms
+                    matched_album = candidate.album or None
+            if not amazon_id:
+                web_match = self._search_amazon_music_web(track)
+                if web_match:
+                    amazon_id, similarity, candidate = web_match
+                    isrc_verified = False
+                    matched_title = candidate.title or matched_title
+                    if candidate.artists:
+                        matched_artists = list(candidate.artists)
+                    if getattr(candidate, "duration_ms", None):
+                        matched_duration_ms = candidate.duration_ms
+                    matched_album = candidate.album or None
+
+        if not amazon_id:
+            logger.debug(f"[Amazon] No Amazon ID found for '{track.title}'")
+            return None
+
+        # Use track title as album fallback for singles where the page scraper
+        # couldn't extract an album name (Amazon single pages often omit it).
+        album = matched_album or track.album or track.title or ""
+
+        if self._prefer_lossy_download:
+            return SearchResult(
+                source="amazon",
+                title=matched_title,
+                artists=matched_artists,
+                album=album,
+                duration_ms=matched_duration_ms,
+                audio_format=AudioFormat.OPUS,
+                quality_kbps=None,
+                is_lossless=False,
+                download_url=None,
+                stream_id=amazon_id,
+                similarity_score=similarity,
+                isrc_match=isrc_verified,
+                is_explicit=track.is_explicit,
+                source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
+            )
+
+        # Amazon HD/Ultra HD serves 24-bit lossless streams — actual bit depth is not
+        # knowable at search time (only from the stream manifest). bit_depth=None lets
+        # the resolver's _HIRES_ADAPTERS logic assume 24-bit, so Amazon competes against
+        # Qobuz when Qobuz explicitly reports 16-bit. Amazon has lower adapter priority
+        # (2 vs Qobuz's 1) so it only wins the quality sort when Qobuz/Tidal explicitly
+        # report 16-bit and Amazon's depth is unknown — the scenario where trying Amazon
+        # can improve on an otherwise 16-bit download.
+        return SearchResult(
+            source="amazon",
+            title=matched_title,
+            artists=matched_artists,
+            album=album,
+            duration_ms=matched_duration_ms,
+            audio_format=AudioFormat.FLAC,
+            quality_kbps=None,
+            is_lossless=True,
+            bit_depth=None,
+            download_url=None,
+            stream_id=amazon_id,
+            similarity_score=similarity,
+            isrc_match=isrc_verified,
+            is_explicit=track.is_explicit,
+            source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
+        )
+
+    def download(self, result: SearchResult, output_path: str) -> str:
+        """
+        Download and decrypt a track using its Amazon ASIN.
+        Tries direct auth first (if configured), then rotates through mirrors.
+        """
+        asin = result.stream_id
+        if not asin:
+            raise ValueError("[Amazon] Missing ASIN in search result")
+
+        resolved_stream = None
+        if isinstance(getattr(result, "source_metadata", None), dict):
+            resolved_stream = result.source_metadata.get("amazon_resolved_stream")
+        if isinstance(resolved_stream, dict) and resolved_stream.get("streamUrl"):
+            try:
+                logger.info(f"[Amazon] Using mirror-resolved stream for ASIN {asin}...")
+                return self._process_download(
+                    resolved_stream["streamUrl"],
+                    resolved_stream.get("decryptionKey"),
+                    output_path,
+                )
+            except Exception as e:
+                logger.warning("[Amazon] Mirror-resolved stream failed, retrying normal ASIN path: %s", e)
+
+        # Try direct DMLS API first — avoids proxy latency and rate-limit exposure
+        if self._direct and self._direct.is_configured():
+            try:
+                logger.info(f"[Amazon-Direct] Fetching stream via DMLS API for ASIN {asin}...")
+                data = self._direct.process_track(asin)
+                return self._process_download(data["streamUrl"], data.get("decryptionKey"), output_path)
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"[Amazon-Direct] Direct auth failed: {err}")
+                if "401" in err or "expired" in err.lower():
+                    raise RuntimeError(
+                        f"[Amazon-Direct] Credentials expired — re-extract from music.amazon.com: {err}"
+                    )
+                if not self._mirrors:
+                    raise
+                logger.info("[Amazon-Direct] Falling back to mirror pool...")
+
+        if not self._mirrors:
+            raise RuntimeError("[Amazon] No direct credentials and no mirrors configured")
+
+        max_attempts = len(self._mirrors)
+        last_error = None
+        saw_rate_limit = False
+
+        for attempt in range(max_attempts):
+            mirror = self._get_working_mirror(force_rotate=(attempt > 0))
+            api_url = f"{mirror}/api/track/{asin}"
+
+            try:
+                logger.debug(f"[Amazon] Fetching stream info (attempt {attempt+1}/{max_attempts}) from {mirror}...")
+                # Atmos (v1.1.8 FEAT-1) takes precedence: the Amazon mirror selects
+                # the EC-3 AdaptationSet from the SIREN_KATANA manifest.
+                if self._requires_atmos:
+                    params = {"format": "atmos"}
+                elif self._prefer_lossy_download:
+                    params = {"prefer_lossy": "true"}
+                else:
+                    params = None
+                resp = self._session.get(api_url, params=params, timeout=20)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    download_url = data.get("streamUrl")
+                    decryption_key = data.get("decryptionKey")
+
+                    if not download_url:
+                        raise RuntimeError("No stream URL returned")
+
+                    # Propagate actual quality metadata from server response so the
+                    # engine/tagger knows the real bit depth and sample rate.
+                    if data.get("bitDepth") or data.get("sampleRate"):
+                        result.source_metadata = dict(result.source_metadata or {})
+                        if data.get("bitDepth"):
+                            result.source_metadata["bit_depth"] = int(data["bitDepth"])
+                        if data.get("sampleRate"):
+                            result.source_metadata["sample_rate_hz"] = int(data["sampleRate"])
+
+                    return self._process_download(
+                        download_url, decryption_key, output_path,
+                        server_codec=(data.get("codec") or "").lower(),
+                    )
+
+                if resp.status_code == 429:
+                    saw_rate_limit = True
+                    raise RateLimitedError(f"[Amazon] Rate limited (429) on {mirror}")
+
+                # 404 = content not available / no lossless stream — all mirrors
+                # will return the same answer, so stop immediately rather than
+                # wasting time rotating through the pool.
+                if resp.status_code == 404:
+                    detail = ""
+                    try:
+                        detail = resp.json().get("detail", "")
+                    except Exception:
+                        pass
+                    msg = detail or "Track not available in this marketplace"
+                    logger.info(f"[Amazon] 404 from mirror — {msg}")
+                    raise RuntimeError(f"[Amazon] ContentNotAvailable: {msg}")  # re-raised outside loop below
+
+                # 403/503 means mirror is blocking/refreshing — permanently remove it
+                if resp.status_code in (403, 503):
+                    logger.debug(f"[Amazon] Mirror returned {resp.status_code} — removing from pool for session")
+                    self._mirror_failures[mirror] = 99
+                    self._current_mirror = None
+                    last_error = f"API error {resp.status_code}"
+                    continue
+
+                # 500 from our own server = Amazon bearer token expired OR geo-restriction
+                # Treat as soft failure — don't permanently remove the mirror
+                if resp.status_code == 500:
+                    logger.debug(f"[Amazon] Mirror returned 500 — soft failure (token expired or geo-restricted)")
+                    self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+                    last_error = f"API error 500 (unavailable — token expired or geo-restricted)"
+                    continue
+
+                logger.debug(f"[Amazon] Mirror {mirror} returned {resp.status_code}")
+                last_error = f"API error {resp.status_code}"
+
+            except RateLimitedError as e:
+                logger.debug(f"[Amazon] Mirror {mirror} rate limited: {e}")
+                last_error = str(e)
+                self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+                continue
+            except Exception as e:
+                logger.debug(f"[Amazon] Mirror {mirror} failed: {e}")
+                last_error = str(e)
+
+            # Non-429 failure — mark mirror and rotate.
+            self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+
+        if saw_rate_limit:
+            raise RateLimitedError(_humanize_amazon_error(last_error or "[Amazon] Rate limited"))
+        raise RuntimeError(_humanize_amazon_error(f"[Amazon] All mirrors failed. Last error: {last_error}"))
+
+    def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
+        # Never retry after a 429 — fall through to the next source immediately.
+        if isinstance(error, RateLimitedError):
+            return False
+        err = str(error)
+        # Marketplace/content misses are deterministic — retrying the same ASIN
+        # on the same mirror won't help.
+        if "404" in err or "ContentNotAvailable" in err or "not available in any marketplace" in err:
+            return False
+        # 403 = auth failure (bad creds, region block, session expired) — retrying
+        # the same mirror with the same credentials will always fail.
+        if "403" in err or "api error 403" in err.lower():
+            return False
+        # Quality mismatch: Amazon claimed 24-bit but delivered 16-bit. Retrying the
+        # same ASIN on the same mirror yields the same stream — give up immediately
+        # so the engine can try Qobuz/HiFi without wasting extra download cycles.
+        if "quality mismatch" in err.lower():
+            return False
+        return True
+
+    # Dolby spatial/surround codecs. ffmpeg picks its strict `ipod` muxer for the
+    # `.m4a` extension, and that muxer's allowlist does NOT include EC-3 or AC-4 —
+    # it fails with "Could not find tag for codec eac3 in stream #0". These must
+    # be written to `.mp4` so ffmpeg selects its general MP4 muxer. Documented in
+    # API-Mirrors/OPERATIONS.md section 6; it was fixed in the web adapter and the
+    # Telegram bot but never here, which is why desktop Atmos never produced a
+    # single file. Verified: the same stream fails to `.m4a` and decrypts cleanly
+    # to `.mp4` as eac3 / 6 channels / 48 kHz.
+    _SPATIAL_CODECS = {"eac3", "ec-3", "ec3", "ac4", "ac-4", "ac3"}
+
+    def _process_download(
+        self,
+        download_url: str,
+        decryption_key: Optional[str],
+        output_path: str,
+        server_codec: str = "",
+    ) -> str:
+        # Download encrypted file
+        temp_enc_path = output_path + ".enc.m4a"
+        logger.debug(f"[Amazon] Downloading encrypted stream: {temp_enc_path}")
+        
+        try:
+            with self._session.get(download_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(temp_enc_path, "wb") as f:
+                    for chunk in r.iter_content(65536):
+                        f.write(chunk)
+
+            codec, duration_seconds = self._probe_audio_stream(temp_enc_path)
+            if codec:
+                logger.debug(
+                    f"[Amazon] Probed codec: {codec}"
+                    + (f" duration={duration_seconds:.2f}s" if duration_seconds else "")
+                )
+            else:
+                logger.debug("[Amazon] Probing failed — treating stream as generic M4A/MP4")
+            # The server tells us the real codec up front; the local probe reads the
+            # still-ENCRYPTED file, where the sample entry is wrapped as `enca`/`encv`
+            # and the true format can be unreadable. Trust the server first.
+            is_spatial = (
+                server_codec in self._SPATIAL_CODECS
+                or (codec or "") in self._SPATIAL_CODECS
+                or self._requires_atmos
+            )
+            if codec == "flac":
+                dec_ext = ".flac"
+            elif is_spatial:
+                dec_ext = ".mp4"
+            else:
+                dec_ext = ".m4a"
+
+            # Decrypt
+            final_path = output_path + dec_ext
+            if not decryption_key:
+                logger.warning(f"[Amazon] No decryption key provided — assuming track is unencrypted.")
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.replace(temp_enc_path, final_path)
+            else:
+                logger.debug(f"[Amazon] Decrypting {codec.upper()} stream using session key...")
+                ffmpeg_err = self._decrypt_file(temp_enc_path, final_path, decryption_key)
+                if ffmpeg_err is not None:
+                    logger.warning(f"[Amazon] ffmpeg decryption failed: {ffmpeg_err} — trying Python fallback")
+                if ffmpeg_err is not None:
+                    py_err = self._decrypt_cenc_python(temp_enc_path, final_path, decryption_key)
+                    if py_err is not None:
+                        raise RuntimeError(
+                            "[Amazon] Amazon returned an unreadable protected audio stream for this track."
+                        )
+                    else:
+                        logger.debug("[Amazon] Python CENC fallback succeeded.")
+                if os.path.exists(temp_enc_path):
+                    os.remove(temp_enc_path)
+        except Exception:
+            # Always clean up the encrypted temp file on any failure path so it
+            # doesn't accumulate as a leftover .enc.m4a in the album folder.
+            if os.path.exists(temp_enc_path):
+                try:
+                    os.remove(temp_enc_path)
+                except OSError:
+                    pass
+            raise
+
+        # Post-process: Standardize extension and remux if needed
+        final_audio_path = self._finalize_audio(final_path)
+        # Dolby Atmos is a spatial format, not a "lossless" one, so the lossless
+        # gate below would discard a perfectly good EC-3 file that the user
+        # explicitly asked for. Skip it when Atmos was requested.
+        if (not self._requires_atmos
+                and not self._prefer_lossy_download
+                and not self._is_lossless_output(final_audio_path)):
+            try:
+                if os.path.exists(final_audio_path):
+                    os.remove(final_audio_path)
+            except Exception:
+                pass
+            raise RuntimeError("[Amazon] Refusing lossy Amazon stream in lossless mode")
+        return final_audio_path
+
+    def _decrypt_file(self, input_path: str, output_path: str, key: str) -> Optional[str]:
+        """
+        Decrypt via ffmpeg.
+        Returns None on success, or an error string describing the failure.
+        """
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
+            result = subprocess.run(
+                [ffmpeg, "-y", "-decryption_key", key.strip(),
+                 "-i", input_path, "-c", "copy", output_path],
+                capture_output=True,
+                timeout=180,
+                **_SUBPROCESS_FLAGS,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="ignore").strip()[-400:]
+                return f"ffmpeg exit {result.returncode}: {stderr}"
+            return None
+        except Exception as e:
+            return f"ffmpeg error: {e}"
+
+    def _decrypt_cenc_python(self, input_path: str, output_path: str, key_hex: str) -> Optional[str]:
+        """
+        Pure-Python AES-CTR CENC decryption using Cryptodome.
+        Fallback for when ffmpeg's -decryption_key fails on the user's system.
+        Handles fragmented MP4 (CMAF) format used by Amazon Music.
+        Returns None on success, or an error string on failure.
+        """
+        try:
+            from Cryptodome.Cipher import AES
+        except ImportError:
+            return "Cryptodome not available for Python CENC fallback"
+
+        try:
+            key = bytes.fromhex(key_hex.strip())
+        except Exception as e:
+            return f"Invalid key hex: {e}"
+        if len(key) not in (16, 24, 32):
+            return f"Key must be 16/24/32 bytes, got {len(key)}"
+
+        # ── ISOBMFF helpers ───────────────────────────────────────────────────
+        def read_box(d, pos):
+            if pos + 8 > len(d):
+                return None
+            sz = struct.unpack_from(">I", d, pos)[0]
+            bt = d[pos+4:pos+8].decode("latin-1", errors="replace")
+            if sz == 1:
+                if pos + 16 > len(d):
+                    return None
+                sz = struct.unpack_from(">Q", d, pos+8)[0]
+                return sz, bt, 16
+            if sz < 8:
+                return None
+            return sz, bt, 8
+
+        def find_first(d, name):
+            pos = 0
+            while pos < len(d):
+                r = read_box(d, pos)
+                if r is None:
+                    break
+                sz, bt, hs = r
+                if bt == name:
+                    return d[pos+hs:pos+sz]
+                pos += sz
+            return None
+
+        def parse_senc(d):
+            """Return (iv_size, [(iv_bytes, subsamples_or_None), ...])."""
+            if len(d) < 8:
+                return 8, []
+            flags = struct.unpack_from(">I", d, 0)[0] & 0xFFFFFF
+            iv_size = 8  # AES-CTR default; override if flag bit 0 set
+            off = 4
+            if flags & 1:
+                # AlgorithmID (3 bytes) + IV_Size (1 byte) + KID (16 bytes)
+                if off + 20 > len(d):
+                    return 8, []
+                iv_size = d[off + 3]
+                off += 20
+            cnt = struct.unpack_from(">I", d, off)[0]
+            off += 4
+            result = []
+            for _ in range(cnt):
+                if off + iv_size > len(d):
+                    break
+                iv = bytes(d[off:off+iv_size])
+                off += iv_size
+                subs = None
+                if flags & 2:
+                    if off + 2 > len(d):
+                        break
+                    sc = struct.unpack_from(">H", d, off)[0]
+                    off += 2
+                    subs = []
+                    for _ in range(sc):
+                        if off + 6 > len(d):
+                            break
+                        subs.append((struct.unpack_from(">H", d, off)[0],
+                                     struct.unpack_from(">I", d, off+2)[0]))
+                        off += 6
+                result.append((iv, subs))
+            return iv_size, result
+
+        def parse_trun(d):
+            """Return (data_offset_or_None, [sample_sizes])."""
+            if len(d) < 8:
+                return None, []
+            flags = struct.unpack_from(">I", d, 0)[0] & 0xFFFFFF
+            cnt = struct.unpack_from(">I", d, 4)[0]
+            off = 8
+            doff = None
+            if flags & 0x001:
+                doff = struct.unpack_from(">i", d, off)[0]
+                off += 4
+            if flags & 0x004:
+                off += 4
+            sizes = []
+            for _ in range(cnt):
+                sz = 0
+                if flags & 0x100: off += 4
+                if flags & 0x200:
+                    sz = struct.unpack_from(">I", d, off)[0]
+                    off += 4
+                if flags & 0x400: off += 4
+                if flags & 0x800: off += 4
+                sizes.append(sz)
+            return doff, sizes
+
+        # ── Load file ─────────────────────────────────────────────────────────
+        try:
+            with open(input_path, "rb") as f:
+                raw = bytearray(f.read())
+        except Exception as e:
+            return f"Cannot read encrypted file: {e}"
+
+        pos, n, changed = 0, len(raw), 0
+
+        while pos < n:
+            r = read_box(raw, pos)
+            if r is None:
+                break
+            moof_sz, bt, moof_hs = r
+            if bt != "moof":
+                pos += moof_sz
+                continue
+
+            moof_start = pos
+            moof_end = pos + moof_sz
+            traf = find_first(raw[pos+moof_hs:moof_end], "traf")
+            if traf is None:
+                pos = moof_end
+                continue
+
+            senc_raw = find_first(traf, "senc")
+            trun_raw = find_first(traf, "trun")
+            if senc_raw is None or trun_raw is None:
+                pos = moof_end
+                continue
+
+            _, samples = parse_senc(senc_raw)
+            doff, sizes = parse_trun(trun_raw)
+
+            # mdat immediately follows moof
+            mr = read_box(raw, moof_end)
+            if mr is None or mr[1] != "mdat":
+                pos = moof_end
+                continue
+            mdat_sz, _, mdat_hs = mr
+
+            # data_offset in trun is relative to the start of moof
+            sample_pos = (moof_start + doff) if doff is not None else (moof_end + mdat_hs)
+
+            for idx, (iv, subs) in enumerate(samples):
+                s_sz = sizes[idx] if idx < len(sizes) else 0
+                if s_sz == 0:
+                    sample_pos += s_sz
+                    continue
+                # Pad IV to 16 bytes (AES-CTR counter initial value)
+                iv16 = iv.ljust(16, b"\x00")
+                cipher = AES.new(key, AES.MODE_CTR, initial_value=iv16, nonce=b"")
+                if subs:
+                    cur = sample_pos
+                    for clear, enc in subs:
+                        cur += clear
+                        if enc > 0:
+                            raw[cur:cur+enc] = cipher.decrypt(bytes(raw[cur:cur+enc]))
+                        cur += enc
+                else:
+                    raw[sample_pos:sample_pos+s_sz] = cipher.decrypt(
+                        bytes(raw[sample_pos:sample_pos+s_sz])
+                    )
+                sample_pos += s_sz
+                changed += 1
+
+            pos = moof_end + mdat_sz
+
+        if not changed:
+            return "No CENC samples found — file may not be fragmented MP4 or is not CENC-encrypted"
+
+        try:
+            with open(output_path, "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            return f"Cannot write decrypted file: {e}"
+
+        return None
+
+    def _finalize_audio(self, path: str) -> str:
+        """
+        Remux to .flac if lossless FLAC is wrapped in M4A container.
+        Skips remux when the codec is known to be lossy (OPUS, AAC, etc.) —
+        those files are left as .m4a for the engine's transcoder to handle.
+        """
+        if not path.lower().endswith(".m4a"):
+            return path
+
+        # Try ffprobe to confirm codec
+        ffprobe_ran = False
+        codec_is_flac = False
+        probed_codec = None
+        try:
+            from antra.utils.runtime import get_ffprobe_exe
+            ffprobe = get_ffprobe_exe()
+            if ffprobe:
+                cmd = [
+                    ffprobe, "-v", "quiet",
+                    "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path
+                ]
+                probed_codec = subprocess.check_output(
+                    cmd, **_SUBPROCESS_FLAGS
+                ).decode().strip().lower()
+                codec_is_flac = probed_codec == "flac"
+                ffprobe_ran = True
+        except Exception:
+            pass
+
+        # If we know it's a lossy codec (opus, aac, mp4a, etc.), leave it as .m4a
+        # so the engine's transcoder can convert it to the requested output format.
+        _LOSSY_CODECS = {"opus", "aac", "mp4a", "vorbis", "mp3"}
+        if ffprobe_ran and probed_codec and probed_codec in _LOSSY_CODECS:
+            logger.debug(f"[Amazon] Skipping FLAC remux — codec is {probed_codec.upper()}, leaving as .m4a for transcoder")
+            return path
+
+        # Remux when ffprobe says FLAC, or when ffprobe wasn't available
+        # (Amazon HD streams are always FLAC-in-M4A — blind attempt is safe).
+        if codec_is_flac or not ffprobe_ran:
+            flac_path = path.rsplit(".", 1)[0] + ".flac"
+            logger.debug(f"[Amazon] Remuxing M4A → FLAC container...")
+            if self._remux_to_flac(path, flac_path):
+                os.remove(path)
+                return flac_path
+
+        return path
+
+    def _is_lossless_output(self, path: str) -> bool:
+        if path.lower().endswith(".flac"):
+            return True
+        try:
+            from antra.utils.runtime import get_ffprobe_exe
+            ffprobe = get_ffprobe_exe() or "ffprobe"
+            cmd = [
+                ffprobe, "-v", "quiet",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]
+            codec = subprocess.check_output(cmd, **_SUBPROCESS_FLAGS).decode().strip().lower()
+            return codec == "flac" or codec == "alac"
+        except Exception:
+            return False
+
+    def _is_playable_without_decryption(self, path: str) -> bool:
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
+            result = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=120,
+                **_SUBPROCESS_FLAGS,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _probe_audio_stream(self, path: str) -> tuple[Optional[str], Optional[float]]:
+        try:
+            from antra.utils.runtime import get_ffprobe_exe
+
+            ffprobe = get_ffprobe_exe() or "ffprobe"
+            cmd = [
+                ffprobe,
+                "-v", "quiet",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name:format=duration",
+                "-of", "json",
+                path,
+            ]
+            raw = subprocess.check_output(cmd, **_SUBPROCESS_FLAGS).decode("utf-8", errors="ignore")
+            data = json.loads(raw or "{}")
+            streams = data.get("streams") or []
+            codec = (streams[0].get("codec_name") if streams else None) or None
+            duration_raw = (data.get("format") or {}).get("duration")
+            duration = None
+            if duration_raw not in (None, ""):
+                try:
+                    duration = float(duration_raw)
+                except Exception:
+                    duration = None
+            return codec, duration
+        except Exception as e:
+            logger.debug(f"[Amazon] Audio probe failed: {e}")
+            return None, None
+
+    def _remux_to_flac(self, input_path: str, output_path: str) -> bool:
+        """Bit-perfect container swap."""
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
+            result = subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-i", input_path,
+                    "-c", "copy",
+                    "-f", "flac",
+                    output_path,
+                ],
+                capture_output=True,
+                timeout=120,
+                **_SUBPROCESS_FLAGS,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+
+def _diagnose():
+    """Run with: python -m antra.sources.amazon"""
+    logging.basicConfig(level=logging.DEBUG)
+    mirrors = ["https://amazon.spotbye.qzz.io"]
+    adapter = AmazonAdapter(mirrors=mirrors)
+    if not adapter.is_available():
+        print("Amazon adapter not available (check ffmpeg and internet).")
+        return
+
+    from antra.core.models import TrackMetadata
+    track = TrackMetadata(
+        title="Bad Guy",
+        artists=["Billie Eilish"],
+        spotify_id="2JpMcmBYYvX3C6p8p8p8"
+    )
+    res = adapter.search(track)
+    if res:
+        print(f"Found: {res.title} (ASIN: {res.stream_id})")
+    else:
+        print("Track not found on Amazon.")
+
+if __name__ == "__main__":
+    _diagnose()

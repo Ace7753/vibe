@@ -1,0 +1,18 @@
+#! spotdl-app-expose.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: spotdl-app
+    namespace: spotdl-app
+    labels:
+        com.docker.compose.project: spotdl-app
+        com.docker.compose.service: spotdl-app
+spec:
+    selector:
+        com.docker.compose.project: spotdl-app
+        com.docker.compose.service: spotdl-app
+    ports:
+        - name: spotdl-app-8080
+          port: 8080
+          targetPort: spotdl-app-8080

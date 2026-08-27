@@ -1,0 +1,325 @@
+"""
+Runtime endpoint manifest loader.
+
+The app ships with a single remote manifest URL that you control. That manifest
+publishes the current endpoint pools for the community-backed lossless sources
+so desktop users can follow endpoint changes without reinstalling the app.
+
+Schema (v2 — includes private mirror servers):
+{
+  "hifi": ["https://..."],
+  "amazon": ["https://...", "https://..."],
+  "mirrors": {
+    "tidal":  "https://your-tidal-host.example",
+    "qobuz":  "https://your-qobuz-host.example",
+    "deezer": "https://your-deezer-host.example",
+    "amazon": "https://your-amazon-host.example",
+    "apple":  "https://your-apple-host.example"
+  }
+}
+
+The "mirrors" block is optional. When present, the values override the
+corresponding TIDAL_MIRROR_URL / QOBUZ_MIRROR_URL / DEEZER_MIRROR_URL env vars
+(env vars take precedence if both are set).
+
+The manifest URL itself is set via ANTRA_ENDPOINT_MANIFEST_URL in .env.
+It can be any HTTPS endpoint you control — a Cloudflare Worker, a private
+server route, or a secret-path JSON file. The URL is never committed to source
+control and is only known to you.
+
+To serve your own manifest from your laptop server, add a static route to any
+of your FastAPI servers, e.g.:
+
+    @app.get("/manifest/your-secret-path")   # unguessable path = your secret
+    async def manifest():
+        return {
+            "mirrors": {
+                "tidal":  "https://your-tidal-host.example",
+                "qobuz":  "https://your-qobuz-host.example",
+                "deezer": "https://your-deezer-host.example"
+            }
+        }
+
+Then set: ANTRA_ENDPOINT_MANIFEST_URL=https://your-manifest-host.example/manifest/your-secret-path
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Built-in fallback manifest URL. Users can still override this via
+# ANTRA_ENDPOINT_MANIFEST_URL or explicit mirror URL env vars.
+DEFAULT_ENDPOINT_MANIFEST_URL = "https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw"
+
+from antra.utils.runtime import get_app_data_dir
+
+# See get_app_data_dir()'s docstring: this is a robust, never-ephemeral
+# resolution. It replaces a bare platformdirs try/except whose fallback
+# resolved inside sys._MEIPASS in a frozen build -- a fresh temp dir wiped on
+# exit -- which made the cache Go writes invisible to Python on every launch.
+_DATA_DIR = get_app_data_dir()
+
+_CACHE_PATH = _DATA_DIR / "endpoint_manifest_cache.json"
+_REQUEST_TIMEOUT = 5
+_GIST_ID_RE = re.compile(r"([0-9a-f]{32})", re.IGNORECASE)
+
+
+@dataclass
+class EndpointManifest:
+    hifi: list[str]
+    amazon: list[str]
+    apple: list[str]
+    # Private mirror server URLs (optional — only present in your personal manifest)
+    mirror_tidal: str = ""
+    mirror_qobuz: str = ""
+    mirror_deezer: str = ""
+    mirror_amazon: str = ""
+    mirror_apple: str = ""
+    # API key for mirror servers (delivered alongside URLs so users need only one config value)
+    api_key: str = ""
+
+    def health_endpoints(self, source: str) -> list[str]:
+        if source == "hifi":
+            return list(self.hifi)
+        if source == "amazon":
+            return list(self.amazon)
+        if source == "apple":
+            return list(self.apple)
+        return []
+
+
+def manifest_fetch_disabled() -> bool:
+    """True when the desktop layer has already supplied the endpoints.
+
+    Set as ANTRA_ENDPOINT_MANIFEST_DISABLED=1 by the Go app (v1.1.8 FEAT-8
+    Phase A) once it has resolved endpoints from the signed-in account. Go holds
+    the device token, so it is the only side that can ask the account — and
+    without this flag the backend would quietly fall back to the PUBLIC GIST,
+    which is the thing being retired.
+
+    Unset means today's behaviour, so nothing changes for anyone not signed in.
+    """
+    return (os.getenv("ANTRA_ENDPOINT_MANIFEST_DISABLED", "") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
+    """Load the endpoint manifest from remote, falling back to the local cache."""
+    if manifest_fetch_disabled():
+        # The endpoints are already in the environment; the cache (written by the
+        # Go layer) fills in anything the env vars do not cover.
+        env_key = (os.getenv("ANTRA_MANIFEST_API_KEY", "") or "").strip()
+        cached = _read_cache()
+        if cached is not None:
+            # The env key wins over a stale cached one, and rescues the case where
+            # the cache exists but predates the key being published.
+            if env_key:
+                cached.api_key = env_key
+            return cached
+        # No cache. Before this, that returned a manifest with NO api_key, the
+        # X-API-Key header was dropped, and every Tidal/Qobuz metadata call got
+        # `401 API key required` -- a missing credential, not a rejected one.
+        # The Go layer now exports the key with the URLs, so an unreadable or
+        # absent cache is no longer fatal.
+        return EndpointManifest(hifi=[], amazon=[], apple=[], api_key=env_key)
+
+    manifest_url = (manifest_url or os.getenv("ANTRA_ENDPOINT_MANIFEST_URL") or DEFAULT_ENDPOINT_MANIFEST_URL).strip()
+
+    if not manifest_url:
+        cached = _read_cache()
+        if cached is not None:
+            return cached
+        logger.info("[Endpoints] No manifest URL configured; endpoint manifest loader is idle")
+        return EndpointManifest(hifi=[], amazon=[], apple=[])
+
+    remote_data = _fetch_remote_manifest(manifest_url)
+    if remote_data is not None:
+        manifest = _parse_manifest(remote_data)
+        _write_cache(manifest)
+        return manifest
+
+    cached = _read_cache()
+    if cached is not None:
+        return cached
+
+    logger.warning("[Endpoints] No remote manifest and no cache available")
+    return EndpointManifest(hifi=[], amazon=[], apple=[])
+
+
+def _fetch_remote_manifest(manifest_url: str) -> Any | None:
+    session = requests.Session()
+    session.trust_env = False
+
+    remote_data = None
+
+    try:
+        response = session.get(manifest_url, timeout=_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        remote_data = response.json()
+    except Exception as exc:
+        logger.debug(f"[Endpoints] Remote manifest fetch failed: {exc}")
+
+    if remote_data is None:
+        gist_id = _extract_gist_id(manifest_url)
+        if gist_id:
+            try:
+                response = session.get(
+                    f"https://api.github.com/gists/{gist_id}",
+                    timeout=_REQUEST_TIMEOUT,
+                    headers={"Accept": "application/vnd.github+json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                remote_data = _extract_manifest_from_gist_payload(payload)
+            except Exception as exc:
+                logger.debug(f"[Endpoints] Gist API manifest fetch failed: {exc}")
+            if remote_data is None:
+                return None
+
+    # Also try to fetch mirrors.txt from the same Gist to merge mirror URLs
+    gist_id = _extract_gist_id(manifest_url)
+    if gist_id and remote_data is not None:
+        try:
+            gist_owner = "anandprtp"
+            owner_m = re.search(r"githubusercontent\.com/([^/]+)/", manifest_url)
+            if owner_m:
+                gist_owner = owner_m.group(1)
+            mirrors_url = f"https://gist.githubusercontent.com/{gist_owner}/{gist_id}/raw/mirrors.txt"
+            if mirrors_url != manifest_url.rstrip("/"):
+                m_resp = session.get(mirrors_url, timeout=_REQUEST_TIMEOUT)
+                if m_resp.status_code == 200:
+                    mirrors_data = m_resp.json()
+                    if isinstance(mirrors_data, dict) and isinstance(remote_data, dict):
+                        remote_mirrors = remote_data.setdefault("mirrors", {})
+                        for key, val in (mirrors_data or {}).items():
+                            if isinstance(val, str) and val.strip() and key not in remote_mirrors:
+                                remote_mirrors[key] = val.strip()
+        except Exception as exc:
+            logger.debug(f"[Endpoints] Gist mirrors.txt fetch failed: {exc}")
+
+    return remote_data
+
+
+def _extract_gist_id(manifest_url: str) -> str | None:
+    match = _GIST_ID_RE.search(manifest_url or "")
+    return match.group(1) if match else None
+
+
+def _extract_manifest_from_gist_payload(payload: Any) -> Any | None:
+    if not isinstance(payload, dict):
+        return None
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        return None
+
+    for file_info in files.values():
+        if not isinstance(file_info, dict):
+            continue
+        content = file_info.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            return json.loads(content)
+        except Exception:
+            continue
+    return None
+
+
+def _parse_manifest(payload: Any) -> EndpointManifest:
+    if isinstance(payload, list):
+        # Transitional compatibility for the old HiFi-only gist format.
+        return EndpointManifest(
+            hifi=_normalize_url_list(payload),
+            amazon=[],
+            apple=[],
+        )
+    if not isinstance(payload, dict):
+        logger.warning("[Endpoints] Manifest payload is not a supported JSON shape")
+        return EndpointManifest(hifi=[], amazon=[], apple=[])
+
+    # Parse optional private mirror block
+    mirrors = payload.get("mirrors") or {}
+    mirror_tidal  = (mirrors.get("tidal")  or "").strip().rstrip("/")
+    mirror_qobuz  = (mirrors.get("qobuz")  or "").strip().rstrip("/")
+    mirror_deezer = (mirrors.get("deezer") or "").strip().rstrip("/")
+    mirror_amazon = (mirrors.get("amazon") or "").strip().rstrip("/")
+    mirror_apple  = (mirrors.get("apple")  or "").strip().rstrip("/")
+    # API key delivered alongside mirror URLs
+    api_key = (payload.get("api_key") or "").strip()
+
+    return EndpointManifest(
+        hifi=_normalize_url_list(payload.get("hifi")),
+        amazon=_normalize_url_list(payload.get("amazon")),
+        apple=_normalize_url_list(payload.get("apple")),
+        mirror_tidal=mirror_tidal,
+        mirror_qobuz=mirror_qobuz,
+        mirror_deezer=mirror_deezer,
+        mirror_amazon=mirror_amazon,
+        mirror_apple=mirror_apple,
+        api_key=api_key,
+    )
+
+
+def _normalize_url_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    seen: set[str] = set()
+    urls: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        url = item.strip().rstrip("/")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+    return urls
+
+
+def _write_cache(manifest: EndpointManifest) -> None:
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        _CACHE_PATH.write_text(
+            json.dumps(
+                {
+                    "hifi": manifest.hifi,
+                    "amazon": manifest.amazon,
+                    "apple": manifest.apple,
+                    "mirrors": {
+                        "tidal":  manifest.mirror_tidal,
+                        "qobuz":  manifest.mirror_qobuz,
+                        "deezer": manifest.mirror_deezer,
+                        "amazon": manifest.mirror_amazon,
+                        "apple":  manifest.mirror_apple,
+                    },
+                    "api_key": manifest.api_key,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.debug(f"[Endpoints] Failed to write manifest cache: {exc}")
+
+
+def _read_cache() -> EndpointManifest | None:
+    try:
+        if not _CACHE_PATH.exists():
+            return None
+        payload = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return None
+        manifest = _parse_manifest(payload)
+        logger.debug("[Endpoints] Loaded endpoint manifest from cache")
+        return manifest
+    except Exception as exc:
+        logger.debug(f"[Endpoints] Failed to read manifest cache: {exc}")
+        return None
