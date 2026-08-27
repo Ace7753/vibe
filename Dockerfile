@@ -1,6 +1,6 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.11-bookworm
 
-# Install ALL runtimes: Python, Node, Java, Go, Build Tools
+# Install ALL runtimes: Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
     openjdk-17-jre-headless golang-go \
@@ -10,14 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy ALL project files including engines
+# Copy ALL project files
 COPY requirements.txt .
 COPY app ./app
 COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install Python Engines (SpotDL + Local Merges)
+# 1. Install ALL Python Engines from Source (Forcing Python 3.11 Compatibility)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
@@ -28,11 +28,11 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install ./engines/savify && \
     pip install ./engines/onthespot
 
-# 2. Install Node Engines (Spotify-DL + EzYTDL)
+# 2. Install Node Engines
 RUN npm install -g ./engines/spotify-dl && \
     npm install -g ./engines/ezytdl || true
 
-# 3. Install Deno (decryption master)
+# 3. Install Deno
 RUN spotdl --download-deno
 
 # Create folders
