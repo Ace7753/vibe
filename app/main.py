@@ -31,10 +31,12 @@ app.mount("/archives", StaticFiles(directory=str(ARCHIVE_DIR)), name="archives")
 app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
 # --- ENGINE CHAIN ---
-async def try_engine(job, label, cmd):
+async def try_engine(job, label, cmd, extra_env=None):
     job["log"].append(f"🔍 [Chain] Attempting Engine: {label}...")
+    env = os.environ.copy()
+    if extra_env: env.update(extra_env)
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
         while True:
             line = await proc.stdout.readline()
             if not line: break
@@ -53,33 +55,34 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
     job["status"] = "running"
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
-    # --- THE NUCLEAR 10-ENGINE CHAIN ---
+    # --- THE ULTIMATE 10-ENGINE NUCLEAR CHAIN ---
+    # We use full paths or installed binary names to guarantee they run.
     engines = [
-        ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4"]),
+        ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4", "--yt-dlp-args", "--impersonate chrome --no-check-certificate --extractor-args \"youtube:player_client=android,ios,web\""]),
         ("Spotify-DL", ["spotifydl", "--url", query, "--output", str(DOWNLOAD_DIR)]),
         ("Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)]),
         ("OnTheSpot", ["onthespot-cli", query]),
         ("Savify", ["savify", "download", query, "--path", str(DOWNLOAD_DIR)]),
         ("Antra", [sys.executable, "-m", "antra", query, "-o", str(DOWNLOAD_DIR)]),
-        ("SpotiFLAC", ["go", "run", "/app/engines/merger/main.go", query]), # Run Go core directly
+        ("SpotiFLAC", ["go", "run", "/app/engines/merger/main.go", query]),
         ("EzYTDL", ["node", "/app/engines/merger/index.js", "--headless", query]),
         ("Web-Downloader", [sys.executable, "-m", "spotify_web_downloader", query, "-o", str(DOWNLOAD_DIR)]),
-        ("YoutubeSpotifyDL", [sys.executable, "/app/engines/merger/spotify_to_mp3.py", query])
+        ("Brute-Fallback", [sys.executable, "/app/engines/merger/spotify_to_mp3.py", query])
     ]
 
     for label, cmd in engines:
-        # Check if we already got the files from a previous engine
-        after = {f.name for f in DOWNLOAD_DIR.glob("*")}
-        if len(after - before) > 0:
-            job["log"].append(f"✅ Success! Engine {label} captured the tracks.")
+        # Check if tracks captured
+        if len({f.name for f in DOWNLOAD_DIR.glob("*")} - before) > 0:
+            job["log"].append(f"✅ Track snagged by {label}!")
             break
 
-        # Add cookies if they exist for relevant engines
+        # Add cookies to relevant engines
         if COOKIE_FILE.exists():
             if label in ["SpotDL", "Votify", "Web-Downloader"]:
                 cmd.extend(["--cookie-file" if label=="SpotDL" else "-c", str(COOKIE_FILE)])
 
-        await try_engine(job, label, cmd)
+        # Run with Protobuf fix
+        await try_engine(job, label, cmd, {"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"})
 
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     new_files = list(after - before)
@@ -91,12 +94,12 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
         job["zip_url"] = f"{base_url}/archives/{zip_name}"
     else:
         job["status"] = "failed"
-        job["log"].append("❌ CRITICAL: ALL 10 ENGINES FAILED. The song is heavily protected or blocked.")
+        job["log"].append("❌ CRITICAL: ALL 10 ENGINES BLOCKED. Update cookies immediately.")
 
 @app.post("/api/download")
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Engaging 10-Engine Nuclear Chain..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Engine warming up (Nuclear Chain)..."], "zip_url": None}
     asyncio.create_task(run_vibe_engine(job_id, query, str(request.base_url).rstrip('/')))
     return {"job_id": job_id}
 
@@ -138,44 +141,38 @@ async def index():
     <style>
         body {{ font-family: 'Plus Jakarta Sans', sans-serif; background-color: {c['bg']}; color: #f5f5f5; overflow-x: hidden; }}
         .glass {{ background: rgba(255, 255, 255, 0.03); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }}
-        .accent-bg {{ background: {c['accent']}; }}
         .nav-active {{ color: {c['accent']}; opacity: 1 !important; }}
     </style>
 </head>
 <body class="min-h-screen pb-24">
     <div class="fixed inset-0 pointer-events-none z-0"><div class="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full opacity-20 blur-[120px]" style="background: {c['accent']};"></div></div>
-
     <nav class="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 glass rounded-full px-6 py-3 flex gap-8 shadow-2xl">
-        <button onclick="showPage('download')" id="nav-download" class="nav-active opacity-60 hover:opacity-100"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
-        <button onclick="showPage('files')" id="nav-files" class="opacity-60 hover:opacity-100"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5.586a1 1 0 0 1 .707.293l5.414 5.414a1 1 0 0 1 .293.707V19a2 2 0 0 1-2 2z"/></svg></button>
-        <button onclick="showPage('settings')" id="nav-settings" class="opacity-60 hover:opacity-100"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg></button>
+        <button onclick="showPage('download')" id="nav-download" class="nav-active opacity-60"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></button>
+        <button onclick="showPage('files')" id="nav-files" class="opacity-60"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5.586a1 1 0 0 1 .707.293l5.414 5.414a1 1 0 0 1 .293.707V19a2 2 0 0 1-2 2z"/></svg></button>
+        <button onclick="showPage('settings')" id="nav-settings" class="opacity-60"><svg class="w-6 h-6" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg></button>
     </nav>
-
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6">
         <header class="mb-12 flex justify-between items-start">
-            <div class="flex items-center gap-4"><img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl" alt="Logo"><div><h1 class="text-3xl font-black tracking-tighter">{c['title']}</h1><p class="text-xs font-bold opacity-40 uppercase">Arsenal v3.0</p></div></div>
-            <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter">Clear All</button>
+            <div class="flex items-center gap-4"><img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl"><div><h1 class="text-3xl font-black tracking-tighter">Vibe</h1><p class="text-xs font-bold opacity-40 uppercase">Arsenal 10-Engine</p></div></div>
+            <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 uppercase transition-all">Clear All</button>
         </header>
-
         <section id="page-download" class="space-y-8">
-            <h2 class="text-5xl font-black italic tracking-tighter text-left">Download <span style="color:{c['accent']}">Spotify</span></h2>
-            <div class="glass rounded-2xl p-2 flex items-center shadow-2xl"><input type="text" id="query" placeholder="Paste Spotify link..." class="bg-transparent flex-1 px-6 py-4 outline-none text-lg font-bold"><button onclick="dl()" class="w-14 h-14 rounded-2xl flex items-center justify-center text-black shadow-xl font-black" style="background:{c['accent']};">GO</button></div>
+            <h2 class="text-5xl font-black italic tracking-tighter">Download <span style="color:#ff2e88">Spotify</span></h2>
+            <div class="glass rounded-2xl p-2 flex items-center shadow-2xl"><input type="text" id="query" placeholder="Paste link..." class="bg-transparent flex-1 px-6 py-4 outline-none text-lg font-bold"><button onclick="dl()" class="w-14 h-14 rounded-2xl flex items-center justify-center text-black shadow-xl font-black" style="background:#ff2e88;">GO</button></div>
             <div id="card" class="glass rounded-2xl p-8 space-y-4">
-                <div class="flex justify-between items-center"><span class="text-[10px] opacity-40 uppercase font-black tracking-widest">Arsenal Chain</span><span id="st" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
-                <div class="w-full bg-white/5 rounded-full h-1 overflow-hidden"><div id="bar" class="h-full transition-all duration-1000 rounded-full" style="width: 0%; background: {c['accent']}"></div></div>
+                <div class="flex justify-between items-center"><span class="text-[10px] opacity-40 uppercase font-black tracking-widest">Progress</span><span id="st" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
+                <div class="w-full bg-white/5 rounded-full h-1 overflow-hidden"><div id="bar" class="h-full transition-all duration-1000 rounded-full" style="width: 0%; background: #ff2e88"></div></div>
                 <div id="logs" class="text-[9px] font-mono text-emerald-500/50 h-32 overflow-y-auto leading-tight p-4 bg-black/20 rounded-xl border border-white/5">Waiting for task...</div>
-                <a id="zip" href="#" class="hidden w-full block bg-white/5 text-center py-4 rounded-xl font-bold text-cyan-400 border border-white/10">📦 Download Pack</a>
+                <a id="zip" href="#" class="hidden w-full block bg-white/5 text-center py-4 rounded-xl font-bold text-cyan-400 border border-white/10 shadow-xl">📦 Download Pack</a>
             </div>
         </section>
-
-        <section id="page-files" class="hidden space-y-6"><h2 class="text-5xl font-black italic tracking-tighter">Your <span style="color:{c['accent']}">Files</span></h2><div id="fl" class="space-y-3"></div></section>
-        <section id="page-settings" class="hidden space-y-6"><h2 class="text-5xl font-black italic tracking-tighter">Settings</h2><div class="glass rounded-2xl p-8 space-y-4"><h3 class="text-xs uppercase font-black opacity-40">Cookie Manager</h3><textarea id="cookies" class="w-full h-48 bg-black/40 rounded-xl p-4 font-mono text-[10px] outline-none border border-white/10" placeholder="Paste cookies..."></textarea><button onclick="save()" class="w-full py-4 rounded-xl font-bold text-black" style="background:{c['accent']};">SAVE COOKIES</button></div></section>
+        <section id="page-files" class="hidden space-y-6"><h2 class="text-5xl font-black italic tracking-tighter">Your <span style="color:#ff2e88">Files</span></h2><div id="fl" class="space-y-3"></div></section>
+        <section id="page-settings" class="hidden space-y-6"><h2 class="text-5xl font-black italic tracking-tighter text-center">Settings</h2><div class="glass rounded-2xl p-8 space-y-4"><h3 class="text-xs uppercase font-black opacity-40">Cookie Manager</h3><textarea id="cookies" class="w-full h-48 bg-black/40 rounded-xl p-4 font-mono text-[10px] outline-none border border-white/10" placeholder="Paste cookies..."></textarea><button onclick="save()" class="w-full py-4 rounded-xl font-bold text-black" style="background:#ff2e88;">SAVE VAULT</button></div></section>
     </main>
-
     <script>
         let cur = null;
         function showPage(p) {{ ['download','files', 'settings'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') rf(); }}
-        async function dl() {{ const q = document.getElementById('query').value.trim(); if(!q) return; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const d = await res.json(); cur = d.job_id; poll(); }}
+        async function dl() {{ const q = document.getElementById('query').value.trim(); if(!q) return; document.getElementById('bar').style.width = '10%'; document.getElementById('logs').innerText = 'Initializing Nuclear Chain...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const d = await res.json(); cur = d.job_id; poll(); }}
         async function poll() {{
             if(!cur) return;
             const res = await fetch('/api/jobs/'+cur);
@@ -190,8 +187,8 @@ async def index():
                 rf();
             }}
         }}
-        async function rf() {{ const res = await fetch('/api/files'); const d = await res.json(); document.getElementById('fl').innerHTML = d.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p></div></a>`).join('') || '<p class="opacity-20">No files yet</p>'; }}
-        async function save() {{ const c = document.getElementById('cookies').value; await fetch('/api/save_cookies', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{cookies:c}})}}); alert('Saved!'); }}
+        async function rf() {{ const res = await fetch('/api/files'); const d = await res.json(); document.getElementById('fl').innerHTML = d.files.length ? d.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p></div></a>`).join('') : '<p class="opacity-20 text-center font-bold">Empty</p>'; }}
+        async function save() {{ const c = document.getElementById('cookies').value; await fetch('/api/save_cookies', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{cookies:c}})}}); alert('Vault Saved!'); }}
         async function clearAll() {{ if(confirm('Clear all?')) {{ await fetch('/api/clear', {{method:'POST'}}); rf(); }} }}
         showPage('download');
     </script>
