@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies + Node.js + Java
+# Install system dependencies + Node.js
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -9,7 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 \
     libstdc++6 \
     gnupg \
-    openjdk-17-jre-headless \
     git \
     build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -22,21 +21,17 @@ WORKDIR /app
 # Copy requirements
 COPY requirements.txt .
 
-# 1. Install ALL Python-based Downloaders (Stable versions for stability)
+# 1. Install Top-Tier Python Downloaders (Confirmed August 2026 Stable)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
     yt-dlp[default,curl-cffi] \
     ytmusicapi>=1.12.1 \
     zspotify \
-    votify \
-    savify \
-    onthespot \
-    spotify-web-downloader \
-    YoutubeSpotifyDL
+    spotify-web-downloader
 
-# 2. Install ALL Node.js-based Downloaders
-RUN npm install -g spotify-dl smd spotify-playlist-downloader
+# 2. Install Top-Tier Node.js Downloaders
+RUN npm install -g spotify-dl
 
 # 3. Install Deno (required for modern YouTube decryption)
 RUN spotdl --download-deno
