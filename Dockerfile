@@ -1,6 +1,6 @@
 FROM python:3.11-bookworm
 
-# Install ALL runtimes: Node, Java, Go, Build Tools
+# Install runtimes: Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
     openjdk-17-jre-headless golang-go \
@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Global fix for Protobuf and Votify
+# Fix Protobuf issue globally
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-ENV PATH="/usr/local/bin:/app/engines/merger/bin:$PATH"
+ENV PATH="/usr/local/bin:$PATH"
 
 WORKDIR /app
 
@@ -21,19 +21,18 @@ COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install Primary Engines
+# 1. Install Global Requirements (Conflict-Free)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install THE ENTIRE MERGER ARSENAL from Source
-RUN cd engines/merger && pip install . || echo "Merger root failed"
-RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi
-RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi
-RUN if [ -d "engines/merger/antra" ]; then cd engines/merger/antra && pip install . ; fi
-RUN if [ -d "engines/merger/src/onthespot" ]; then cd engines/merger && pip install . ; fi
+# 2. Install "Arsenal" Engines from the Flat Merger Folder
+# We rename the project files temporarily to install them one-by-one if needed,
+# but pip install . usually picks up pyproject.toml first.
+RUN cd engines/merger && pip install . || echo "Primary merger install failed"
+RUN cd engines/merger && pip install -e . || echo "Secondary merger install failed"
 
-# 3. Install ALL Node Engines
+# 3. Install Node Engines from the Merger Root
 RUN cd engines/merger && npm install && \
     ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
     chmod +x /app/engines/merger/cli.js
