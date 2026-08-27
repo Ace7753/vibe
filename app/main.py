@@ -49,10 +49,12 @@ app.mount("/archives", StaticFiles(directory=str(ARCHIVE_DIR)), name="archives")
 app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
 # --- MULTI-ENGINE CHAIN ---
-async def try_engine(job, name, cmd):
+async def try_engine(job, name, cmd, extra_env=None):
     job["log"].append(f"🔍 [Engine] Swapping to {name}...")
+    env = os.environ.copy()
+    if extra_env: env.update(extra_env)
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
         while True:
             line = await proc.stdout.readline()
             if not line: break
@@ -84,17 +86,18 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
     # --- ENGINE 2: SPOTIFY-DL (NODE) ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_engine(job, "Spotify-DL", ["spotify-dl", "--url", query, "--output", str(DOWNLOAD_DIR)])
+        await try_engine(job, "Spotify-DL", ["spotifydl", "--url", query, "--output", str(DOWNLOAD_DIR)])
 
     # --- ENGINE 3: VOTIFY ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_engine(job, "Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)])
+        # Protobuf fix for Votify
+        await try_engine(job, "Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)], {"PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"})
 
     # --- ENGINE 4: ONTHESPOT ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_engine(job, "OnTheSpot", ["onthespot", query])
+        await try_engine(job, "OnTheSpot", ["onthespot-cli", query])
 
     # FINAL ASSEMBLY
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
