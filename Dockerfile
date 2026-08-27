@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-# Install system dependencies + Node.js
+# Install system dependencies + Node.js + Java
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 \
     libstdc++6 \
     gnupg \
+    openjdk-17-jre-headless \
     git \
+    build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -20,15 +22,20 @@ WORKDIR /app
 # Copy requirements
 COPY requirements.txt .
 
-# 1. Install the "Big Three" Spotify Engines (Highest Reliability)
+# 1. Install ALL requested Python engines
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
     yt-dlp[default,curl-cffi] \
-    ytmusicapi>=1.12.1
+    ytmusicapi>=1.12.1 \
+    zspotify \
+    git+https://github.com/glomatico/votify.git \
+    git+https://github.com/LaurenceRawlings/savify.git \
+    git+https://github.com/ots-downloader/onthespot.git \
+    git+https://github.com/glomatico/spotify-web-downloader.git
 
-# 2. Install Node.js Spotify Core
-RUN npm install -g spotify-dl
+# 2. Install requested Node.js engines
+RUN npm install -g spotify-dl smd spotify-playlist-downloader
 
 # 3. Install Deno (required for modern YouTube decryption)
 RUN spotdl --download-deno
