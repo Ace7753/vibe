@@ -1,6 +1,6 @@
 FROM python:3.11-bookworm
 
-# Install runtimes: Node, Java, Go, Build Tools
+# Install ALL runtimes: Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
     openjdk-17-jre-headless golang-go \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix Protobuf issue globally
+# Global fix for Protobuf and Votify
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 ENV PATH="/usr/local/bin:/app/engines/merger/bin:$PATH"
 
@@ -26,23 +26,23 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install Python Engines from Merger subfolders
-RUN cd engines/merger && pip install . || echo "Merger root pip install failed"
-RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi || echo "Votify failed"
-RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi || echo "Savify failed"
+# 2. Install THE ENTIRE MERGER ARSENAL from Source
+RUN cd engines/merger && pip install . || echo "Merger root failed"
+RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi
+RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi
+RUN if [ -d "engines/merger/antra" ]; then cd engines/merger/antra && pip install . ; fi
+RUN if [ -d "engines/merger/src/onthespot" ]; then cd engines/merger && pip install . ; fi
 
-# 3. Install Node Engines (Using the Merger root as spotify-dl)
+# 3. Install ALL Node Engines
 RUN cd engines/merger && npm install && \
     ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
-    chmod +x /app/engines/merger/cli.js || echo "Node install failed"
+    chmod +x /app/engines/merger/cli.js
 
 # 4. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders
 RUN mkdir -p downloads archives
-
-# Ensure cookies.txt exists
 RUN touch cookies.txt
 
 EXPOSE 8080
