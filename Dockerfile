@@ -26,20 +26,19 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. CREATE MASTER BINARY LINKS (Force engine names to work)
-# Node engines
-RUN cd engines/merger && npm install && \
-    ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
-    chmod +x /app/engines/merger/cli.js
+# 2. BRUTE-FORCE ENGINE MAPPING (Bypassing all path errors)
+# Create direct shell-script launchers for every engine in /usr/local/bin
+RUN echo '#!/bin/bash\nnode /app/engines/merger/cli.js "$@"' > /usr/local/bin/spotifydl && \
+    echo '#!/bin/bash\nexport PYTHONPATH=$PYTHONPATH:/app/engines/merger/votify\npython3 -m votify "$@"' > /usr/local/bin/votify && \
+    echo '#!/bin/bash\nexport PYTHONPATH=$PYTHONPATH:/app/engines/merger/src\npython3 /app/engines/merger/src/onthespot/cli.py "$@"' > /usr/local/bin/onthespot && \
+    echo '#!/bin/bash\nexport PYTHONPATH=$PYTHONPATH:/app/engines/merger/savify\npython3 -m savify "$@"' > /usr/local/bin/savify && \
+    echo '#!/bin/bash\nexport PYTHONPATH=$PYTHONPATH:/app/engines/merger/antra\npython3 -m antra "$@"' > /usr/local/bin/antra && \
+    chmod +x /usr/local/bin/spotifydl /usr/local/bin/votify /usr/local/bin/onthespot /usr/local/bin/savify /usr/local/bin/antra
 
-# Python engines (using module mode via wrapper scripts)
-RUN echo '#!/bin/bash\npython3 -m votify "$@"' > /usr/local/bin/votify && \
-    echo '#!/bin/bash\npython3 -m onthespot "$@"' > /usr/local/bin/onthespot && \
-    echo '#!/bin/bash\npython3 -m savify "$@"' > /usr/local/bin/savify && \
-    echo '#!/bin/bash\npython3 -m antra "$@"' > /usr/local/bin/antra && \
-    chmod +x /usr/local/bin/votify /usr/local/bin/onthespot /usr/local/bin/savify /usr/local/bin/antra
+# 3. NPM Dependencies for Node Engines
+RUN cd engines/merger && npm install || true
 
-# 3. Decryption Master
+# 4. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders

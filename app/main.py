@@ -34,7 +34,13 @@ app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 async def try_engine(job, label, cmd):
     job["log"].append(f"🔍 [Arsenal] Swapping to {label}...")
     try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        # Use stdin=PIPE to prevent "EOF" hanging on interactive engines
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.PIPE
+        )
 
         async def read_stream(stream):
             while True:
@@ -46,7 +52,12 @@ async def try_engine(job, label, cmd):
                     job["log"] = job["log"][-100:]
 
         try:
-            await asyncio.wait_for(read_stream(proc.stdout), timeout=420)
+            # Provide empty input to engines that might wait for it
+            if proc.stdin:
+                proc.stdin.write(b"\n\n\n")
+                await proc.stdin.drain()
+
+            await asyncio.wait_for(read_stream(proc.stdout), timeout=480)
         except asyncio.TimeoutError:
             proc.kill()
             job["log"].append(f"⚠️ {label} timed out.")
@@ -63,7 +74,7 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
     job["status"] = "running"
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
-    # --- THE NUCLEAR 10-ENGINE CHAIN (V5 - STABILIZED) ---
+    # --- THE NUCLEAR 10-ENGINE CHAIN (V6 - BRUTE FORCE) ---
     engines = [
         ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4", "--yt-dlp-args", "--impersonate chrome --no-check-certificate --extractor-args \"youtube:player_client=android,ios,web\""]),
         ("Spotify-DL", ["spotifydl", "--url", query, "--output", str(DOWNLOAD_DIR)]),
@@ -78,12 +89,10 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
     ]
 
     for label, cmd in engines:
-        # Check if files captured
         if len({f.name for f in DOWNLOAD_DIR.glob("*")} - before) > 0:
-            job["log"].append(f"✅ Track snagged by {label}!")
+            job["log"].append(f"✅ Success! Tracks secured by {label}.")
             break
 
-        # Inject cookies into command if applicable
         if COOKIE_FILE.exists():
             if label in ["SpotDL", "Votify", "Web-Downloader"]:
                 cmd.extend(["--cookie-file" if label=="SpotDL" else "-c", str(COOKIE_FILE)])
@@ -98,15 +107,14 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
         with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
             for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
         job["zip_url"] = f"{base_url}/archives/{zip_name}"
-        job["log"].append("✅ Track secured! Proof of Arsenal.")
     else:
         job["status"] = "failed"
-        job["log"].append("❌ CRITICAL: ALL 10 ENGINES FAILED. The song is heavily protected.")
+        job["log"].append("❌ CRITICAL: EVERY ENGINE BLOCKED. Update cookies.")
 
 @app.post("/api/download")
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Arsenal warming up (10-Chain)..."], "zip_url": None}
+    JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Engines Warming Up..."], "zip_url": None}
     asyncio.create_task(run_vibe_engine(job_id, query, str(request.base_url).rstrip('/')))
     return {"job_id": job_id}
 
@@ -160,14 +168,14 @@ async def index():
     </nav>
     <main class="relative z-10 max-w-xl mx-auto pt-16 px-6">
         <header class="mb-12 flex justify-between items-start">
-            <div class="flex items-center gap-4"><img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl"><div><h1 class="text-3xl font-black tracking-tighter">Vibe</h1><p class="text-xs font-bold opacity-40 uppercase">Arsenal Multi-Engine</p></div></div>
+            <div class="flex items-center gap-4"><img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl"><div><h1 class="text-3xl font-black tracking-tighter">Vibe</h1><p class="text-xs font-bold opacity-40 uppercase">Arsenal 10-Engine</p></div></div>
             <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 uppercase transition-all">Clear All</button>
         </header>
         <section id="page-download" class="space-y-8">
             <h2 class="text-5xl font-black italic tracking-tighter">Download <span style="color:#ff2e88">Spotify</span></h2>
             <div class="glass rounded-2xl p-2 flex items-center shadow-2xl"><input type="text" id="query" placeholder="Paste link..." class="bg-transparent flex-1 px-6 py-4 outline-none text-lg font-bold"><button onclick="dl()" class="w-14 h-14 rounded-2xl flex items-center justify-center text-black shadow-xl font-black" style="background:#ff2e88;">GO</button></div>
             <div id="card" class="glass rounded-2xl p-8 space-y-4">
-                <div class="flex justify-between items-center"><span class="text-[10px] opacity-40 uppercase font-black tracking-widest">Arsenal Status</span><span id="st" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
+                <div class="flex justify-between items-center"><span class="text-[10px] opacity-40 uppercase font-black tracking-widest">Progress</span><span id="st" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
                 <div class="w-full bg-white/5 rounded-full h-1 overflow-hidden"><div id="bar" class="h-full transition-all duration-1000 rounded-full" style="width: 0%; background: #ff2e88"></div></div>
                 <div id="logs" class="text-[9px] font-mono text-emerald-500/50 h-32 overflow-y-auto leading-tight p-4 bg-black/20 rounded-xl border border-white/5">Waiting for task...</div>
                 <a id="zip" href="#" class="hidden w-full block bg-white/5 text-center py-4 rounded-xl font-bold text-cyan-400 border border-white/10 shadow-xl">📦 Download Pack</a>
