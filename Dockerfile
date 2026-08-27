@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix Protobuf issue globally
+# Fix Protobuf and Path issues
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ENV PYTHONPATH="/app/engines/merger:/app/engines/merger/src:/app/engines/merger/savify:/app/engines/merger/votify:$PYTHONPATH"
 
 WORKDIR /app
 
@@ -20,25 +21,17 @@ COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install Primary Engines
+# 1. Install Global Requirements (Conflict-Free + Consolidated)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install EVERY Engine from Merger subfolders (The Arsenal)
-# We go into each folder and install them one by one.
-RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi
-RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi
-RUN if [ -d "engines/merger/antra" ]; then cd engines/merger/antra && pip install . ; fi
-RUN if [ -f "engines/merger/setup.py" ]; then cd engines/merger && pip install . ; fi
-RUN if [ -f "engines/merger/setup.cfg" ]; then cd engines/merger && pip install . ; fi
-
-# 3. Install Node Engines (Linking them for global access)
+# 2. Install Node Engines from the Merger Root
 RUN cd engines/merger && npm install && \
     ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
     chmod +x /app/engines/merger/cli.js
 
-# 4. Decryption Master
+# 3. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders
