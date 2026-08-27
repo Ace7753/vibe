@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libstdc++6 \
     gnupg \
     git \
-    build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -21,16 +20,14 @@ WORKDIR /app
 # Copy requirements
 COPY requirements.txt .
 
-# 1. Install Top-Tier Python Downloaders (Confirmed August 2026 Stable)
+# 1. Install the "Big Three" Spotify Engines (Highest Reliability)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
     yt-dlp[default,curl-cffi] \
-    ytmusicapi>=1.12.1 \
-    zspotify \
-    spotify-web-downloader
+    ytmusicapi>=1.12.1
 
-# 2. Install Top-Tier Node.js Downloaders
+# 2. Install Node.js Spotify Core
 RUN npm install -g spotify-dl
 
 # 3. Install Deno (required for modern YouTube decryption)
