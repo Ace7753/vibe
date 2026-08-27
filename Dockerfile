@@ -1,6 +1,6 @@
-FROM python:3.14-slim-bookworm
+FROM python:3.12-slim-bookworm
 
-# Install system dependencies + Node.js + Java (for SpotiFlyer cores)
+# Install system dependencies + Node.js + Java
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     openjdk-17-jre-headless \
     git \
+    build-essential \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -21,13 +22,12 @@ WORKDIR /app
 # Copy requirements
 COPY requirements.txt .
 
-# 1. Install ALL Python-based Downloaders from GitHub/PyPI
+# 1. Install ALL Python-based Downloaders (Stable versions for stability)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 \
-    "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" \
+    yt-dlp[default,curl-cffi] \
     ytmusicapi>=1.12.1 \
-    curl-cffi \
     zspotify \
     votify \
     savify \
