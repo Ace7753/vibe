@@ -85,16 +85,13 @@ async def run_spotdl(job_id: str, query: str, base_url: str):
 
     # --- THE AWS NUCLEAR BYPASS (AUGUST 2026) ---
     # 1. We prioritize YouTube Music/YouTube now that cookies are confirmed working
-    # 2. Relaxed duration matching (max-duration-error) to fix "No usable results"
-    # 3. Explicitly enabling Deno for cloud IP decryption
+    # 2. Optimized for spotdl 4.5.2 compatibility
     cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR / output_template),
         "--format", "m4a",
         "--bitrate", "disable",
         "--threads", "4",
-        "--max-duration-error", "120",
-        "--use-deno",
         "--search-query", "{artist} - {title}",
         "--audio", "youtube-music", "youtube", "soundcloud", "piped",
         "--yt-dlp-args", "--no-check-certificate --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=ios,web;player_skip=webpage\" --add-header \"Accept-Language:en-US,en;q=0.9\" --add-header \"Referer:https://www.google.com/\""
