@@ -17,22 +17,21 @@ COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
 
-# 1. Install ALL Python Engines from Source (Forcing Python 3.11 Compatibility)
+# 1. Install Primary Engines
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir spotdl==4.5.2 \
-    yt-dlp[default,curl-cffi] \
-    ytmusicapi>=1.12.1 \
-    zspotify && \
-    pip install ./engines/votify && \
-    pip install ./engines/savify && \
-    pip install ./engines/onthespot
+    pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install Node Engines
-RUN npm install -g ./engines/spotify-dl && \
-    npm install -g ./engines/ezytdl || true
+# 2. Install Every Engine from Local Source (One by One to avoid total failure)
+RUN pip install ./engines/votify || echo "Votify install failed, skipping"
+RUN pip install ./engines/onthespot || echo "OnTheSpot install failed, skipping"
+RUN pip install ./engines/savify || echo "Savify install failed, skipping"
 
-# 3. Install Deno
+# 3. Install Node Engines
+RUN npm install -g ./engines/spotify-dl || echo "Spotify-DL install failed, skipping"
+RUN npm install -g smd spotify-playlist-downloader || echo "NPM engines failed, skipping"
+
+# 4. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders

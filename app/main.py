@@ -27,7 +27,7 @@ for d in [DOWNLOAD_DIR, ARCHIVE_DIR]: d.mkdir(exist_ok=True)
 # --- CONFIG ---
 DEFAULT_CONFIG = {
     "title": "Vibe",
-    "tagline": "The Perfected Downloader",
+    "tagline": "Spotify Downloader",
     "accent": "#ff2e88",
     "bg": "#050505",
     "port": 8080
@@ -48,28 +48,30 @@ app.mount("/downloads", StaticFiles(directory=str(DOWNLOAD_DIR)), name="download
 app.mount("/archives", StaticFiles(directory=str(ARCHIVE_DIR)), name="archives")
 app.mount("/assets", StaticFiles(directory=str(BASE_DIR)), name="assets")
 
-# --- MULTI-ENGINE LOGIC ---
-async def try_command(job, label, cmd):
-    job["log"].append(f"🔍 [Engine] Swapping to {label}...")
+# --- MULTI-ENGINE CHAIN ---
+async def try_engine(job, name, cmd):
+    job["log"].append(f"🔍 [Engine] Swapping to {name}...")
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         while True:
             line = await proc.stdout.readline()
             if not line: break
             msg = line.decode(errors='replace').strip()
-            if msg: job["log"].append(f"[{label}] {msg[:100]}"); job["log"] = job["log"][-100:]
+            if msg:
+                job["log"].append(f"[{name}] {msg[:100]}")
+                job["log"] = job["log"][-100:]
         rc = await proc.wait()
         return rc == 0
     except Exception as e:
-        job["log"].append(f"⚠️ {label} skip: {str(e)[:50]}")
+        job["log"].append(f"⚠️ {name} skip: {str(e)[:50]}")
         return False
 
-async def run_god_engine(job_id: str, query: str, base_url: str):
+async def run_vibe_engine(job_id: str, query: str, base_url: str):
     job = JOBS[job_id]
     job["status"] = "running"
     before = {f.name for f in DOWNLOAD_DIR.glob("*")}
 
-    # 1. SpotDL (Master)
+    # --- ENGINE 1: SPOTDL (MASTER) ---
     spotdl_cmd = [
         sys.executable, "-m", "spotdl", "download", query,
         "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4",
@@ -77,24 +79,24 @@ async def run_god_engine(job_id: str, query: str, base_url: str):
         "--yt-dlp-args", "--no-check-certificate --geo-bypass --rm-cache-dir --extractor-args \"youtube:player_client=ios,web;player_skip=webpage\""
     ]
     if COOKIE_FILE.exists(): spotdl_cmd.extend(["--cookie-file", str(COOKIE_FILE)])
-    await try_command(job, "SpotDL", spotdl_cmd)
+    await try_engine(job, "SpotDL", spotdl_cmd)
 
-    # 2. Spotify-DL (Node Fallback)
+    # --- ENGINE 2: SPOTIFY-DL (NODE) ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_command(job, "Spotify-DL", ["spotify-dl", "--url", query, "--output", str(DOWNLOAD_DIR)])
+        await try_engine(job, "Spotify-DL", ["spotify-dl", "--url", query, "--output", str(DOWNLOAD_DIR)])
 
-    # 3. Votify Fallback
+    # --- ENGINE 3: VOTIFY ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_command(job, "Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)])
+        await try_engine(job, "Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)])
 
-    # 4. EzYTDL Fallback (Headless)
+    # --- ENGINE 4: ONTHESPOT ---
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     if len(after - before) == 0:
-        await try_command(job, "EzYTDL", ["node", "/app/engines/ezytdl/index.js", "--headless", query])
+        await try_engine(job, "OnTheSpot", ["onthespot", query])
 
-    # FINAL CHECK
+    # FINAL ASSEMBLY
     after = {f.name for f in DOWNLOAD_DIR.glob("*")}
     new_files = list(after - before)
     if new_files:
@@ -103,9 +105,10 @@ async def run_god_engine(job_id: str, query: str, base_url: str):
         with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
             for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
         job["zip_url"] = f"{base_url}/archives/{zip_name}"
+        job["log"].append("✅ Track secured! Download ready.")
     else:
         job["status"] = "failed"
-        job["log"].append("❌ Every engine on GitHub was blocked. Update cookies in Settings.")
+        job["log"].append("❌ Every GitHub engine failed. Check your cookies or query.")
 
 # --- API ---
 @app.get("/api/health")
@@ -118,8 +121,8 @@ async def get_cfg(): return SITE_CONFIG
 async def start_dl(request: Request, query: str = Form(...)):
     job_id = uuid.uuid4().hex
     base_url = str(request.base_url).rstrip('/')
-    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine warming up..."], "zip_url": None}
-    asyncio.create_task(run_god_engine(job_id, query, base_url))
+    JOBS[job_id] = {"id": job_id, "query": query, "status": "queued", "log": ["Engine starting (Multi-Fallback)..."], "zip_url": None}
+    asyncio.create_task(run_vibe_engine(job_id, query, base_url))
     return {"job_id": job_id}
 
 @app.get("/api/jobs/{job_id}")
@@ -134,7 +137,7 @@ async def list_files(request: Request):
     for p in sorted(DOWNLOAD_DIR.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True):
         if p.is_file() and not p.name.startswith('.'):
             files.append({"name": p.name, "url": f"{base_url}/downloads/{p.name}", "type": "mp3"})
-    return {"files": files[:100]}
+    return {"files": files[:150]}
 
 @app.post("/api/save_cookies")
 async def save_cookies(data: dict):
@@ -151,7 +154,7 @@ async def clear_downloads():
             if item.is_file(): item.unlink()
     return {"status": "ok"}
 
-# --- UI (Original Pink Vibe Design Restored) ---
+# --- UI (ORIGINAL PINK VIBE RESTORED) ---
 @app.get("/", response_class=HTMLResponse)
 async def index():
     c = SITE_CONFIG
@@ -188,16 +191,18 @@ async def index():
         </button>
     </nav>
 
-    <main class="relative z-10 max-w-xl mx-auto pt-16 px-6">
+    <main class="relative z-10 max-w-xl mx-auto pt-16 px-6 pb-32">
         <header class="mb-12 flex justify-between items-start">
             <div class="flex items-center gap-4">
                 <img src="/assets/vibe_icon_original.png" class="w-12 h-12 rounded-xl shadow-xl" alt="Logo">
                 <div>
                     <h1 class="text-3xl font-black tracking-tighter">{c['title']}</h1>
-                    <p class="text-xs font-bold opacity-40 uppercase tracking-widest">Multi-Engine Active</p>
+                    <p class="text-xs font-bold opacity-40">{c['tagline']}</p>
                 </div>
             </div>
-            <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 uppercase tracking-tighter transition-all">Clear All</button>
+            <div class="flex gap-2">
+                 <button onclick="clearAll()" class="text-[10px] font-black opacity-30 hover:opacity-100 border border-white/20 px-3 py-1 rounded-full uppercase tracking-tighter transition-all">Clear All</button>
+            </div>
         </header>
 
         <section id="page-download" class="space-y-8">
@@ -207,15 +212,18 @@ async def index():
                 <button onclick="startDownload()" class="w-14 h-14 rounded-2xl flex items-center justify-center text-black shadow-xl accent-bg font-black">GO</button>
             </div>
             <div id="status-card" class="glass rounded-2xl p-8 space-y-6">
-                <div class="flex justify-between mb-4"><span class="text-[10px] opacity-40 uppercase tracking-widest font-black">Chain Progress</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
+                <div class="flex justify-between mb-4"><span class="text-xs opacity-40 uppercase tracking-widest font-bold">Progress</span><span id="engine-status" class="text-xs px-3 py-1 rounded bg-neutral-900 text-cyan-400 font-bold">READY</span></div>
                 <div class="space-y-4">
-                    <p id="activity-text" class="text-sm font-bold opacity-80 truncate">Awaiting link...</p>
+                    <p id="activity-text" class="text-sm font-bold opacity-80 truncate">Waiting for input...</p>
                     <div class="w-full bg-white/5 rounded-full h-1 overflow-hidden">
                         <div id="progress-bar" class="h-full transition-all duration-500 rounded-full" style="width: 0%; background: {c['accent']}"></div>
                     </div>
                 </div>
-                <div id="engine-log" class="text-[9px] font-mono text-emerald-500/50 h-48 overflow-y-auto leading-tight p-4 bg-black/20 rounded-xl border border-white/5">Waiting for task...</div>
-                <a id="insta-zip" href="#" class="hidden w-full block bg-white/5 text-center py-4 rounded-xl font-bold text-cyan-400 border border-white/10 shadow-xl">📦 Download Pack</a>
+                <button onclick="toggleLogs()" class="mt-6 text-[10px] opacity-30 hover:opacity-100 uppercase font-black tracking-tighter transition-all">View Technical Details</button>
+                <div id="engine-log-container" class="hidden mt-4">
+                    <div id="engine-log" class="text-[9px] font-mono text-emerald-500/50 h-48 overflow-y-auto leading-tight p-4 bg-black/20 rounded-xl border border-white/5">Ready</div>
+                </div>
+                <a id="insta-zip" href="#" class="hidden w-full block bg-white/5 text-center py-4 rounded-xl font-bold text-cyan-400 border border-white/10 shadow-xl">📦 Download Pack Your Files</a>
             </div>
         </section>
 
@@ -228,17 +236,17 @@ async def index():
             <h2 class="text-5xl font-black italic tracking-tighter text-center">Settings</h2>
             <div class="glass rounded-2xl p-8 space-y-4">
                 <h3 class="text-xs uppercase font-black opacity-40">Cookie Manager</h3>
-                <p class="text-[10px] opacity-50">Paste your combined cookies here to unblock all engines.</p>
-                <textarea id="cookie-input" class="w-full h-48 bg-black/40 rounded-xl p-4 font-mono text-[10px] outline-none border border-white/10" placeholder="Paste cookies..."></textarea>
-                <button onclick="saveCookies()" class="w-full py-4 rounded-xl font-bold accent-bg text-black">SAVE COOKIE VAULT</button>
+                <textarea id="cookie-input" class="w-full h-48 bg-black/40 rounded-xl p-4 font-mono text-[10px] outline-none border border-white/10" placeholder="Paste cookies.txt content here..."></textarea>
+                <button onclick="saveCookies()" class="w-full py-4 rounded-xl font-bold accent-bg text-black uppercase">Save Cookies</button>
             </div>
         </section>
     </main>
 
     <script>
         let currentJob = null;
+        function toggleLogs() {{ const log = document.getElementById('engine-log-container'); log.classList.toggle('hidden'); }}
         function showPage(p) {{ ['download','files', 'settings'].forEach(id => {{ document.getElementById('page-'+id).classList.add('hidden'); document.getElementById('nav-'+id).classList.remove('nav-active'); }}); document.getElementById('page-'+p).classList.remove('hidden'); document.getElementById('nav-'+p).classList.add('nav-active'); if(p==='files') refreshFiles(); }}
-        async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '10%'; document.getElementById('activity-text').innerText = 'Starting Multi-Engine Chain...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
+        async function startDownload() {{ const q = document.getElementById('dl-query').value.trim(); if(!q) return; document.getElementById('progress-bar').style.width = '10%'; document.getElementById('activity-text').innerText = 'Initializing...'; const fd = new FormData(); fd.append('query', q); const res = await fetch('/api/download', {{method:'POST', body:fd}}); const data = await res.json(); currentJob = data.job_id; pollEngine(); }}
         async function pollEngine() {{
             if(!currentJob) return;
             const res = await fetch('/api/jobs/'+currentJob);
@@ -249,14 +257,14 @@ async def index():
             logElement.scrollTop = logElement.scrollHeight;
             if(job.status==='running'||job.status==='queued') {{ document.getElementById('progress-bar').style.width = '50%'; setTimeout(pollEngine, 1500); }}
             else {{
-                if (job.status === 'complete') {{ document.getElementById('progress-bar').style.width = '100%'; document.getElementById('activity-text').innerText = 'Success!'; }}
+                if (job.status === 'complete') {{ document.getElementById('progress-bar').style.width = '100%'; document.getElementById('activity-text').innerText = 'Complete!'; }}
                 if(job.zip_url) {{const z=document.getElementById('insta-zip'); z.href=job.zip_url; z.classList.remove('hidden');}}
                 refreshFiles();
             }}
         }}
-        async function refreshFiles() {{ const res = await fetch('/api/files'); const data = await res.json(); document.getElementById('file-list').innerHTML = data.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p></div></a>`).join('') || '<p class="text-center py-12 opacity-20 font-bold">No files snagged yet</p>'; }}
-        async function saveCookies() {{ const cookies = document.getElementById('cookie-input').value; await fetch('/api/save_cookies', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{cookies}})}}); alert('Cookie Vault Updated!'); }}
-        async function clearAll() {{ if(confirm('Wipe all downloads?')) {{ await fetch('/api/clear', {{method:'POST'}}); refreshFiles(); }} }}
+        async function refreshFiles() {{ const res = await fetch('/api/files'); const data = await res.json(); document.getElementById('file-list').innerHTML = data.files.length ? data.files.map(f => `<a href="${{f.url}}" download class="glass flex items-center gap-4 p-4 rounded-xl"><div class="text-2xl">${{f.type==='zip'?'📦':'🎵'}}</div><div class="flex-1 min-w-0"><p class="truncate text-sm font-bold">${{f.name}}</p></div></a>`).join('') : '<p class="text-center py-12 opacity-20 font-bold">No files yet</p>'; }}
+        async function saveCookies() {{ const cookies = document.getElementById('cookie-input').value; await fetch('/api/save_cookies', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{cookies}})}}); alert('Cookies Saved!'); }}
+        async function clearAll() {{ if(confirm('Clear all downloads?')) {{ await fetch('/api/clear', {{method:'POST'}}); refreshFiles(); }} }}
         showPage('download');
     </script>
 </body>
