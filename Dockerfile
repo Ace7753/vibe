@@ -1,6 +1,6 @@
 FROM python:3.14-slim-bookworm
 
-# Install system dependencies including Node.js (for spotify-dl)
+# Install system dependencies + Node.js + Java (for SpotiFlyer cores)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
@@ -9,24 +9,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 \
     libstdc++6 \
     gnupg \
+    openjdk-17-jre-headless \
+    git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y node-js \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Install Python packages
-# Forcing yt-dlp master branch for the absolute latest August 2026 bypasses
+# Copy requirements
 COPY requirements.txt .
+
+# 1. Install ALL Python-based Downloaders from GitHub/PyPI
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir spotdl==4.5.2 "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" ytmusicapi>=1.12.1 curl-cffi zspotify
+    pip install --no-cache-dir spotdl==4.5.2 \
+    "https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz" \
+    ytmusicapi>=1.12.1 \
+    curl-cffi \
+    zspotify \
+    votify \
+    savify \
+    onthespot \
+    spotify-web-downloader \
+    YoutubeSpotifyDL
 
-# Install Node.js downloaders
-RUN npm install -g spotify-dl
+# 2. Install ALL Node.js-based Downloaders
+RUN npm install -g spotify-dl smd spotify-playlist-downloader
 
-# Install Deno (required for modern YouTube decryption on cloud IPs)
+# 3. Install Deno (required for modern YouTube decryption)
 RUN spotdl --download-deno
 
 # Create directories
@@ -37,11 +49,8 @@ COPY app ./app
 COPY vibe_icon_original.png .
 COPY vibe-config.json .
 
-# Diagnostic: List files
-RUN ls -la /app
-
 # Expose port
 EXPOSE 8080
 
-# Run with python -u to ensure logs are flushed immediately for AWS monitoring
+# Run with python -u to ensure logs are flushed immediately
 CMD ["python", "-u", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
