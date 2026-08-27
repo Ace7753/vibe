@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix Protobuf issue globally for all engines
+# Global fix for Protobuf and Votify
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ENV PATH="/usr/local/bin:$PATH"
 
 WORKDIR /app
 
@@ -25,13 +26,12 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install Every Engine from Local Source (One by One for maximum stability)
-# We use -e or direct path to ensure binaries are linked to /usr/local/bin
-RUN pip install ./engines/votify || echo "Votify failed"
-RUN pip install ./engines/onthespot || echo "OnTheSpot failed"
-RUN pip install ./engines/savify || echo "Savify failed"
+# 2. Install Every Engine and FORCE link binaries to /usr/local/bin
+RUN pip install ./engines/votify && ln -sf /usr/local/bin/votify /usr/local/bin/votify-cli || true
+RUN pip install ./engines/onthespot && ln -sf /usr/local/bin/onthespot-cli /usr/local/bin/onthespot || true
+RUN pip install ./engines/savify || true
 
-# 3. Install Node Engines (Using full path linking)
+# 3. Install Node Engines and FORCE link
 RUN npm install -g ./engines/spotify-dl && \
     ln -sf /usr/local/lib/node_modules/@swapnilsoni1999/spotify-dl/cli.js /usr/local/bin/spotifydl || true
 
