@@ -1,6 +1,6 @@
 FROM python:3.11-bookworm
 
-# Install ALL runtimes: Node, Java, Go, Build Tools
+# Install runtimes: Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
     openjdk-17-jre-headless golang-go \
@@ -8,9 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Global fix for Protobuf and Votify
+# Fix Protobuf issue globally
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-ENV PATH="/usr/local/bin:$PATH"
+ENV PATH="/usr/local/bin:/app/engines/merger/bin:$PATH"
 
 WORKDIR /app
 
@@ -26,20 +26,24 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install Every Engine and FORCE link binaries to /usr/local/bin
-RUN pip install ./engines/votify && ln -sf /usr/local/bin/votify /usr/local/bin/votify-cli || true
-RUN pip install ./engines/onthespot && ln -sf /usr/local/bin/onthespot-cli /usr/local/bin/onthespot || true
-RUN pip install ./engines/savify || true
+# 2. Install Python Engines from Merger subfolders
+RUN cd engines/merger && pip install . || echo "Merger root pip install failed"
+RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi || echo "Votify failed"
+RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi || echo "Savify failed"
 
-# 3. Install Node Engines and FORCE link
-RUN npm install -g ./engines/spotify-dl && \
-    ln -sf /usr/local/lib/node_modules/@swapnilsoni1999/spotify-dl/cli.js /usr/local/bin/spotifydl || true
+# 3. Install Node Engines (Using the Merger root as spotify-dl)
+RUN cd engines/merger && npm install && \
+    ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
+    chmod +x /app/engines/merger/cli.js || echo "Node install failed"
 
 # 4. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders
 RUN mkdir -p downloads archives
+
+# Ensure cookies.txt exists
+RUN touch cookies.txt
 
 EXPOSE 8080
 CMD ["python", "-u", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
