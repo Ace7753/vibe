@@ -1,6 +1,6 @@
 FROM python:3.11-bookworm
 
-# Install ALL runtimes: Node, Java, Go, Build Tools
+# Install runtimes: Node, Java, Go, Build Tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates curl unzip libgcc-s1 libstdc++6 gnupg git build-essential \
     openjdk-17-jre-headless golang-go \
@@ -8,9 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Fix Protobuf and Path issues
+# Fix Protobuf issue globally
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-ENV PYTHONPATH="/app/engines/merger:/app/engines/merger/src:/app/engines/merger/savify:/app/engines/merger/votify:$PYTHONPATH"
 
 WORKDIR /app
 
@@ -26,12 +25,18 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir spotdl==4.5.2 "yt-dlp[default,curl-cffi]" ytmusicapi>=1.12.1
 
-# 2. Install Node Engines from the Merger Root
+# 2. Install "Arsenal" Engines by entering their specific folders
+# This ensures they are registered as global commands without PYTHONPATH hacks
+RUN if [ -d "engines/merger/votify" ]; then cd engines/merger/votify && pip install . ; fi || true
+RUN if [ -d "engines/merger/savify" ]; then cd engines/merger/savify && pip install . ; fi || true
+RUN if [ -d "engines/merger/antra" ]; then cd engines/merger/antra && pip install . ; fi || true
+
+# 3. Install Node Engines (Using the Merger root as the project)
 RUN cd engines/merger && npm install && \
     ln -sf /app/engines/merger/cli.js /usr/local/bin/spotifydl && \
-    chmod +x /app/engines/merger/cli.js
+    chmod +x /app/engines/merger/cli.js || true
 
-# 3. Decryption Master
+# 4. Decryption Master
 RUN spotdl --download-deno
 
 # Create folders

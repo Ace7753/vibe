@@ -1,9 +1,0 @@
-{
-    "name": "ezytdl",
-    "description": "ezytdl connector for firefox",
-    "path": "S:\\dev\\ezytdl\\ezytdl\\ezytdl.exe",
-    "type": "stdio",
-    "allowed_extensions": [
-        "ezytdl@sylviiu.dev"
-    ]
-}
