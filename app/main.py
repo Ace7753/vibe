@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import uuid
 import zipfile
@@ -21,6 +22,38 @@ ARCHIVE_DIR = Path(os.getenv("ARCHIVE_DIR", str(BASE_DIR / "archives"))).resolve
 COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 for d in [DOWNLOAD_DIR, ARCHIVE_DIR]: d.mkdir(exist_ok=True)
+
+SPOTIFY_URL_RE = re.compile(r"^https://open\.spotify\.com/(track|album|playlist|artist)/[A-Za-z0-9]+")
+
+def validate_input(value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned: raise ValueError("Enter a Spotify URL or search query.")
+    if SPOTIFY_URL_RE.match(cleaned): return cleaned
+    if "://" not in cleaned and 2 <= len(cleaned) <= 300: return cleaned
+    raise ValueError("Use a Spotify URL or a search like Artist - Song.")
+
+def smart_template(query: str) -> str:
+    q = query.lower()
+    if "open.spotify.com/playlist" in q: return "Playlists/{artist} - {title}.{output-ext}"
+    if "open.spotify.com/album" in q: return "{artist} - {album}/{track-number}. {title}.{output-ext}"
+    if "open.spotify.com/artist" in q: return "Artists/{artist}/{album}/{track-number}. {title}.{output-ext}"
+    return "{artist} - {title}.{output-ext}"
+
+def resolve_output(query: str) -> str:
+    pattern = smart_template(query)
+    if "{output-ext}" not in pattern: pattern += ".{output-ext}"
+    return str(DOWNLOAD_DIR / pattern.replace("\\", "/").strip())
+
+def all_files(): return [p for p in DOWNLOAD_DIR.rglob("*") if p.is_file()]
+
+def get_file_list(base_url: str):
+    files = []
+    for path in sorted(all_files(), key=lambda p: p.stat().st_mtime, reverse=True):
+        rel = path.relative_to(DOWNLOAD_DIR).as_posix()
+        files.append({"name": rel, "url": f"{base_url}/downloads/{rel}", "type": "mp3"})
+    for path in sorted(ARCHIVE_DIR.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+        files.append({"name": path.name, "url": f"{base_url}/archives/{path.name}", "type": "zip"})
+    return files[:150]
 
 SITE_CONFIG = {"title": "Vibe", "tagline": "Spotify Downloader", "accent": "#ff2e88", "bg": "#050505"}
 JOBS: Dict[str, dict] = {}
@@ -72,39 +105,43 @@ async def try_engine(job, label, cmd):
 async def run_vibe_engine(job_id: str, query: str, base_url: str):
     job = JOBS[job_id]
     job["status"] = "running"
-    before = {f.name for f in DOWNLOAD_DIR.glob("*")}
+    before = {f.relative_to(DOWNLOAD_DIR).as_posix() for f in DOWNLOAD_DIR.rglob("*") if f.is_file()}
+    output_pattern = resolve_output(query)
 
-    # --- THE NUCLEAR 10-ENGINE CHAIN (V6 - BRUTE FORCE) ---
+    # --- THE NUCLEAR 10-ENGINE CHAIN (V6 - ARSENAL HEADLESS) ---
     engines = [
-        ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", str(DOWNLOAD_DIR), "--format", "m4a", "--threads", "4", "--yt-dlp-args", "--impersonate chrome --no-check-certificate --extractor-args \"youtube:player_client=android,ios,web\""]),
+        ("SpotDL", [sys.executable, "-m", "spotdl", "download", query, "--output", output_pattern, "--format", "m4a", "--threads", "4", "--yt-dlp-args", "--impersonate chrome --no-check-certificate --extractor-args \"youtube:player_client=android,ios,web\""]),
         ("Spotify-DL", ["spotifydl", "--url", query, "--output", str(DOWNLOAD_DIR)]),
         ("Votify", ["votify", query, "-o", str(DOWNLOAD_DIR)]),
         ("OnTheSpot", ["onthespot", query]),
         ("Savify", ["savify", "download", query, "--path", str(DOWNLOAD_DIR)]),
         ("Antra", ["antra", query, "-o", str(DOWNLOAD_DIR)]),
-        ("SpotiFLAC", ["go", "run", "/app/engines/merger/main.go", query]),
-        ("EzYTDL", ["node", "/app/engines/merger/index.js", "--headless", query]),
-        ("Web-Downloader", ["python3", "-m", "spotify_web_downloader", query, "-o", str(DOWNLOAD_DIR)]),
-        ("Brute-Fallback", ["python3", "/app/engines/merger/spotify_to_mp3.py", query])
+        ("SpotiFLAC", ["spotiflac-cli", "-query", query, "-output", str(DOWNLOAD_DIR)]),
+        ("EzYTDL", ["yt-dlp", "--impersonate", "chrome", "--extract-audio", "--audio-format", "mp3", "--no-check-certificate", "--output", f"{DOWNLOAD_DIR}/%(title)s.%(ext)s", f"ytsearch:{query}"]),
+        ("Web-Downloader", ["spotify-web-downloader", "download", query, "--output-path", str(DOWNLOAD_DIR)]),
+        ("Brute-Fallback", ["spotdl", "download", query, "--audio", "youtube-music", "--output", str(DOWNLOAD_DIR), "--format", "mp3", "--overwrite", "skip"])
     ]
 
     for label, cmd in engines:
-        if len({f.name for f in DOWNLOAD_DIR.glob("*")} - before) > 0:
+        if ({f.relative_to(DOWNLOAD_DIR).as_posix() for f in DOWNLOAD_DIR.rglob("*") if f.is_file()} - before):
             job["log"].append(f"✅ Success! Tracks secured by {label}.")
             break
 
         if COOKIE_FILE.exists():
-            if label in ["SpotDL", "Votify", "Web-Downloader"]:
-                cmd.extend(["--cookie-file" if label=="SpotDL" else "-c", str(COOKIE_FILE)])
+            if label in ["SpotDL", "Votify", "Web-Downloader", "EzYTDL"]:
+                if label == "SpotDL": cmd.extend(["--cookie-file", str(COOKIE_FILE)])
+                elif label == "Votify": cmd.extend(["-c", str(COOKIE_FILE)])
+                elif label == "Web-Downloader": cmd.extend(["--cookies-path", str(COOKIE_FILE)])
+                elif label == "EzYTDL": cmd.extend(["--cookies", str(COOKIE_FILE)])
 
         await try_engine(job, label, cmd)
 
-    after = {f.name for f in DOWNLOAD_DIR.glob("*")}
+    after = {f.relative_to(DOWNLOAD_DIR).as_posix() for f in DOWNLOAD_DIR.rglob("*") if f.is_file()}
     new_files = list(after - before)
     if new_files:
         job["status"] = "complete"
         zip_name = f"Vibe_Pack_{job_id[:4]}.zip"
-        with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w') as zf:
+        with zipfile.ZipFile(ARCHIVE_DIR / zip_name, 'w', zipfile.ZIP_DEFLATED) as zf:
             for f in new_files: zf.write(DOWNLOAD_DIR / f, arcname=f)
         job["zip_url"] = f"{base_url}/archives/{zip_name}"
     else:
@@ -113,6 +150,11 @@ async def run_vibe_engine(job_id: str, query: str, base_url: str):
 
 @app.post("/api/download")
 async def start_dl(request: Request, query: str = Form(...)):
+    try:
+        query = validate_input(query)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {"id": job_id, "status": "queued", "log": ["Engines Warming Up..."], "zip_url": None}
     asyncio.create_task(run_vibe_engine(job_id, query, str(request.base_url).rstrip('/')))
@@ -123,10 +165,7 @@ async def get_job(job_id: str): return JOBS.get(job_id, {"status": "not_found", 
 
 @app.get("/api/files")
 async def list_files(request: Request):
-    base_url = str(request.base_url).rstrip('/')
-    files = [{"name": p.name, "url": f"{base_url}/archives/{p.name}", "type": "zip"} for p in sorted(ARCHIVE_DIR.glob("*.zip"), key=lambda x: x.stat().st_mtime, reverse=True)]
-    files += [{"name": p.name, "url": f"{base_url}/downloads/{p.name}", "type": "mp3"} for p in sorted(DOWNLOAD_DIR.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True) if p.is_file()]
-    return {"files": files[:150]}
+    return {"files": get_file_list(str(request.base_url).rstrip('/'))}
 
 @app.post("/api/save_cookies")
 async def save_cookies(data: dict):

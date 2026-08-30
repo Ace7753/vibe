@@ -1,0 +1,44 @@
+{
+    "family": "vibe-task",
+    "networkMode": "awsvpc",
+    "containerDefinitions": [
+        {
+            "name": "vibe-container",
+            "image": "020033178044.dkr.ecr.us-east-1.amazonaws.com/vibe:latest",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "DOWNLOAD_DIR",
+                    "value": "/app/downloads"
+                },
+                {
+                    "name": "ARCHIVE_DIR",
+                    "value": "/app/archives"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/vibe",
+                    "awslogs-region": "us-east-1",
+                    "awslogs-stream-prefix": "vibe"
+                }
+            }
+        }
+    ],
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "cpu": "1024",
+    "memory": "2048",
+    "executionRoleArn": "arn:aws:iam::020033178044:role/vibe-execution-role",
+    "taskRoleArn": "arn:aws:iam::020033178044:role/vibe-execution-role"
+}

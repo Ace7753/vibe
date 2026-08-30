@@ -1,8 +1,9 @@
-# CONSOLIDATED ARSENAL REQUIREMENTS (CONFLICT-FREE)
+# CONSOLIDATED ARSENAL REQUIREMENTS
+Sphinx==3.4.3
 async-lru>=2.1.0
 boto3
 bump2version==1.0.1
-click
+click>=8.3.1
 colorama>=0.4.6
 construct==2.8.8
 coverage==5.4
@@ -11,9 +12,10 @@ dataclass-click>=1.0.4
 fastapi
 ffmpy>=0.3.0
 flake8==3.8.4
-flask>=3.1.0
 flask-login>=0.6.3
-httpx
+flask>=3.1.0
+httpx>=0.28.1
+httpx-retries>=0.6.0
 imageio-ffmpeg>=0.6.0
 inquirerpy>=0.3.4
 librespot @ git+https://github.com/justin025/librespot-python.git
@@ -21,11 +23,10 @@ lyricsgenius>=3.0.1
 m3u8>=6.0.0
 music-tag>=0.4.3
 mutagen>=1.47.0
-pillow
-pip==21.1.3
+pillow>=12.1.0
 platformdirs>=4.0.0
 playwright>=1.52.0
-protobuf
+protobuf>=6.33.5
 pybase62>=1.0.0
 pycryptodome>=3.23.0
 pycryptodomex>=3.23.0
@@ -33,20 +34,20 @@ pyinstaller>=6.15.0
 pyotp>=2.9.0
 pyqt6>=6.8.0
 pyqt6_sip>=13.9.1
-pytest==6.2.2
 pytest-runner==5.2
+pytest==6.2.2
 python-dotenv>=1.0.0
 python-multipart
-pywidevine
+pywidevine>=1.9.0
 requests
 slskd-api>=0.1.5
-Sphinx==3.4.3
-spotdl
+spotdl==4.5.2
 spotipy>=2.16.1
 tidalapi>=0.8.11
 tldextract>=3.1.0
 tox==3.21.3
 twine==3.3.0
+unplayplay>=0.0.9
 urllib3>=2.2.3
 uvicorn
 validators>=0.18.2
@@ -54,5 +55,5 @@ watchdog==1.0.2
 websockets>=13.0
 wheel>=0.45.0
 youtube-dl>=2021.6.6
-yt-dlp
+yt-dlp>=2026.8.19
 ytmusicapi
