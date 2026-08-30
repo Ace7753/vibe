@@ -25,7 +25,7 @@ COPY app ./app
 COPY vibe_icon_original.png .
 COPY vibe-config.json .
 COPY engines ./engines
-COPY cookies.txt .
+COPY cookies.txt* .
 
 # 1. Install Global Requirements
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
